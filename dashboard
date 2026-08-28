@@ -45,7 +45,7 @@
  *      Showing enddate as an ETA would be actively misleading.
  */
 
-define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget, log) {
+define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, serverWidget, log, runtime) {
 
     // ---------------------------------------------------------------- config
 
@@ -84,6 +84,83 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
         31: 10   // Canada Distributor
     };
     var DEFAULT_LEAD_DAYS = 10;
+
+    /**
+     * Builds a status predicate that matches BOTH status formats.
+     *
+     * This is the single nastiest portability trap in this script. SuiteQL run
+     * through the REST/SuiteTalk endpoint returns transaction status as the bare
+     * code ('B'). SuiteQL run through N/query inside a Suitelet returns it
+     * PREFIXED with the transaction type ('SalesOrd:B', 'WorkOrd:B').
+     *
+     * A filter written for one form silently matches NOTHING in the other -- no
+     * error, no warning, just an empty report. Always filter through this helper.
+     */
+    function statusIn(col, type, codes) {
+        var vals = [];
+        codes.forEach(function (c) {
+            vals.push("'" + c + "'");                 // bare form:    B
+            vals.push("'" + type + ":" + c + "'");    // prefixed form: SalesOrd:B
+        });
+        return '(' + col + ' IN (' + vals.join(',') + '))';
+    }
+
+    var SO_OPEN = ['A', 'B', 'D', 'E'];   // Pending Approval, Pending Fulfillment,
+                                          // Partially Fulfilled, Pending Billing/Part Fulfilled
+    var WO_OPEN = ['A', 'B', 'D'];        // Planned, Released, In Process
+
+    /**
+     * Customer type tabs. Maps customer category ID -> tab key.
+     * Any category not listed falls to UNASSIGNED, as does a customer record with
+     * no category set at all (cat_id 0).
+     */
+    var TAB_OF_CATEGORY = {
+        // Retail / direct-to-consumer / marketplace
+        5:  'RETAIL',   // Inside Sales
+        6:  'RETAIL',   // GEN-Y US Web Orders
+        7:  'RETAIL',   // GEN-Y CDN Web Orders
+        8:  'RETAIL',   // Amazon US
+        9:  'RETAIL',   // AMAZON-CAN
+        10: 'RETAIL',   // Ebay-US
+        21: 'RETAIL',   // GEN-Y WEB-US -IA
+        25: 'RETAIL',   // Box Store
+        26: 'RETAIL',   // Walmart
+        30: 'RETAIL',   // TikTok
+
+        // OEM / manufacturers building us into their product
+        15: 'OEM',      // Manufacturer/OEM
+        16: 'OEM',      // Sponsor Account
+        22: 'OEM',      // Inter Company
+
+        // Wholesale / distribution / dealer network
+        1:  'WHOLESALE',  // National Distribution
+        2:  'WHOLESALE',  // E-Commerce Wholesale
+        4:  'WHOLESALE',  // Master Dealer
+        11: 'WHOLESALE',  // Standard Dealer
+        13: 'WHOLESALE',  // Regional Distribution
+        14: 'WHOLESALE',  // Jobber/Fleet
+        17: 'WHOLESALE',  // Canada
+        18: 'WHOLESALE',  // Not Specified
+        23: 'WHOLESALE',  // Chile
+        24: 'WHOLESALE',  // United Kingdom
+        28: 'WHOLESALE',  // House Account
+        29: 'WHOLESALE',  // International Distributor
+        31: 'WHOLESALE'   // Canada Distributor
+    };
+
+    // Order matters -- this is left-to-right tab order.
+    // UNASSIGNED renders only when it actually has orders, so in normal operation
+    // this is a three-tab report as specified.
+    var TABS = [
+        { key: 'RETAIL',     label: 'Retail' },
+        { key: 'OEM',        label: 'OEM' },
+        { key: 'WHOLESALE',  label: 'Wholesale' },
+        { key: 'UNASSIGNED', label: 'Unassigned', onlyIfPopulated: true }
+    ];
+
+    function tabForCategory(catId) {
+        return TAB_OF_CATEGORY[catId] || 'UNASSIGNED';
+    }
 
     var STATUS = {
         SHIP:    { key: 'SHIP',    label: 'Ship now',  rank: 0, css: 'st-ship'  },
@@ -127,6 +204,17 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
         return Math.round((b.getTime() - a.getTime()) / 86400000);
     }
 
+    /**
+     * Order notes are free text and run long (some are multi-sentence updates
+     * from the sales team). The row shows a clipped preview with the full text on
+     * hover; the drill-down still shows it in full.
+     */
+    function clip(txt, max) {
+        var t = String(txt || '').replace(/\s+/g, ' ').trim();
+        if (!t) return '';
+        return (t.length <= max) ? t : t.substring(0, max - 1) + '\u2026';
+    }
+
     function soUrl(id) {
         return '/app/accounting/transactions/salesord.nl?id=' + id;
     }
@@ -157,7 +245,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             "  c.entityid          AS cust_num, " +
             "  c.companyname       AS cust_name, " +
             "  NVL(c.category, 0)  AS cat_id, " +
-            "  tl.id               AS line_id, " +
+            "  tl.uniquekey        AS line_id, " +   // tl.id is the per-order line index, NOT unique
             "  tl.linesequencenumber AS line_seq, " +
             "  tl.memo             AS line_memo, " +
             "  i.id                AS item_id, " +
@@ -166,7 +254,8 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             "  ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) AS qty_open, " +
             "  NVL(i.custitem_gny_max_buildable, 0) AS max_build, " +
             "  NVL(ib.avail, 0)    AS qty_avail, " +
-            "  NVL(ib.onhand, 0)   AS qty_onhand " +
+            "  NVL(ib.onhand, 0)   AS qty_onhand, " +
+            "  tlm.expectedshipdate AS exp_ship " +
             "FROM transaction t " +
             "JOIN customer c ON c.id = t.entity " +
             "JOIN transactionline tl ON tl.transaction = t.id " +
@@ -175,8 +264,11 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             "   SELECT item, SUM(quantityonhand) AS onhand, SUM(quantityavailable) AS avail " +
             "   FROM inventorybalance WHERE location = " + HITCH_LOCATION + " GROUP BY item " +
             ") ib ON ib.item = tl.item " +
+            // Real ship date lives on the MAINLINE row. transaction.enddate is
+            // null account-wide, so do not reach for it.
+            "LEFT JOIN transactionline tlm ON tlm.transaction = t.id AND tlm.mainline = 'T' " +
             "WHERE t.type = 'SalesOrd' " +
-            "  AND t.status IN ('A','B','D','E') " +
+            "  AND " + statusIn('t.status', 'SalesOrd', SO_OPEN) + " " +
             "  AND tl.mainline = 'F' " +
             "  AND tl.location = " + HITCH_LOCATION + " " +
             "  AND tl.isclosed = 'F' " +
@@ -203,7 +295,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             "FROM transaction w " +
             "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
             "WHERE w.type = 'WorkOrd' " +
-            "  AND w.status IN ('A','B','D') " +
+            "  AND " + statusIn('w.status', 'WorkOrd', WO_OPEN) + " " +
             "  AND w.custbody_gyh_traveler_printed = 'T' " +
             "GROUP BY wl.item";
 
@@ -217,6 +309,135 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             };
         });
         return map;
+    }
+
+    // ----------------------------------------------------------- diagnostics
+
+    /**
+     * Runs a ladder of progressively narrower queries. The first row that drops
+     * to zero names the predicate that is killing the report. Run this by adding
+     * &debug=T to the Suitelet URL.
+     *
+     * This exists because SuiteQL run through an integration role and SuiteQL run
+     * inside a Suitelet do NOT always see the same rows -- role permissions,
+     * subsidiary restrictions and feature access all apply at query time.
+     */
+    function runProbes() {
+        var probes = [
+            ['1. any transaction row',
+             "SELECT COUNT(*) AS n FROM transaction"],
+
+            ['2. sales orders',
+             "SELECT COUNT(*) AS n FROM transaction WHERE type = 'SalesOrd'"],
+
+            ['3. + open status A/B/D/E',
+             "SELECT COUNT(*) AS n FROM transaction WHERE type = 'SalesOrd' " +
+             "AND " + statusIn('status', 'SalesOrd', SO_OPEN)],
+
+            ['3b. status format check (bare codes)',
+             "SELECT COUNT(*) AS n FROM transaction WHERE type = 'SalesOrd' " +
+             "AND status IN ('A','B','D','E')"],
+
+            ['3c. status format check (prefixed codes)',
+             "SELECT COUNT(*) AS n FROM transaction WHERE type = 'SalesOrd' " +
+             "AND status IN ('SalesOrd:A','SalesOrd:B','SalesOrd:D','SalesOrd:E')"],
+
+            ['4. + joined to lines',
+             "SELECT COUNT(*) AS n FROM transaction t " +
+             "JOIN transactionline tl ON tl.transaction = t.id " +
+             "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " AND tl.mainline = 'F'"],
+
+            ['5. + location = ' + HITCH_LOCATION,
+             "SELECT COUNT(*) AS n FROM transaction t " +
+             "JOIN transactionline tl ON tl.transaction = t.id " +
+             "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
+             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION],
+
+            ['6. + line open and item type',
+             "SELECT COUNT(*) AS n FROM transaction t " +
+             "JOIN transactionline tl ON tl.transaction = t.id " +
+             "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
+             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION + " " +
+             "AND tl.isclosed = 'F' AND tl.itemtype IN ('Assembly','InvtPart','Kit') " +
+             "AND ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) > 0"],
+
+            ['7. + join customer',
+             "SELECT COUNT(*) AS n FROM transaction t " +
+             "JOIN customer c ON c.id = t.entity " +
+             "JOIN transactionline tl ON tl.transaction = t.id " +
+             "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
+             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION],
+
+            ['8. + join item',
+             "SELECT COUNT(*) AS n FROM transaction t " +
+             "JOIN transactionline tl ON tl.transaction = t.id " +
+             "JOIN item i ON i.id = tl.item " +
+             "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
+             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION],
+
+            ['9. inventorybalance readable',
+             "SELECT COUNT(*) AS n FROM inventorybalance WHERE location = " + HITCH_LOCATION],
+
+            ['10. item.custitem_gny_max_buildable readable',
+             "SELECT COUNT(*) AS n FROM item WHERE custitem_gny_max_buildable IS NOT NULL"],
+
+            ['11. transaction.custbody_ordernotes readable',
+             "SELECT COUNT(*) AS n FROM transaction WHERE custbody_ordernotes IS NOT NULL"],
+
+            ['12. WO printed flag readable',
+             "SELECT COUNT(*) AS n FROM transaction WHERE type = 'WorkOrd' " +
+             "AND custbody_gyh_traveler_printed = 'T'"],
+
+            ['13. FULL production query',
+             "SELECT COUNT(*) AS n FROM transaction t " +
+             "JOIN customer c ON c.id = t.entity " +
+             "JOIN transactionline tl ON tl.transaction = t.id " +
+             "JOIN item i ON i.id = tl.item " +
+             "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
+             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION + " " +
+             "AND tl.isclosed = 'F' AND tl.itemtype IN ('Assembly','InvtPart','Kit') " +
+             "AND ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) > 0"]
+        ];
+
+        return probes.map(function (p) {
+            var out = { label: p[0], count: null, error: null };
+            try {
+                var res = query.runSuiteQL({ query: p[1] }).asMappedResults();
+                out.count = (res && res.length) ? num(res[0].n) : 0;
+            } catch (e) {
+                out.error = e.message || String(e);
+            }
+            log.audit({ title: 'PROBE ' + p[0], details: out.error ? ('ERROR: ' + out.error) : out.count });
+            return out;
+        });
+    }
+
+    function renderDebug(probes, ctxInfo) {
+        var h = renderStyles();
+        h += '<div id="' + WRAP + '">';
+        h += '<div class="hd">Buildable Orders &mdash; Diagnostics</div>';
+        h += '<div class="sub">The first step that returns 0 is the one breaking the report. ' +
+             'Remove &amp;debug=T from the URL to return to the dashboard.</div>';
+
+        h += '<div class="warn"><b>Execution context:</b> ' + esc(ctxInfo) + '</div>';
+
+        h += '<table class="grid"><tr><th>Step</th><th>Rows</th><th>Result</th></tr>';
+        probes.forEach(function (p) {
+            var cell, pill;
+            if (p.error) {
+                cell = '<span class="late">error</span>';
+                pill = '<span class="pill st-block">' + esc(p.error) + '</span>';
+            } else if (p.count === 0) {
+                cell = '<span class="late">0</span>';
+                pill = '<span class="pill st-block">returns nothing</span>';
+            } else {
+                cell = p.count;
+                pill = '<span class="pill st-ship">ok</span>';
+            }
+            h += '<tr><td>' + esc(p.label) + '</td><td>' + cell + '</td><td>' + pill + '</td></tr>';
+        });
+        h += '</table></div>';
+        return h;
     }
 
     // --------------------------------------------------------- core analysis
@@ -246,14 +467,33 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
                     ? LEAD_DAYS[r.cat_id]
                     : DEFAULT_LEAD_DAYS;
                 var due = td ? addDays(td, lead) : null;
+                var dueSource = 'derived';
+
+                // OEM orders carry a real scheduled ship date on the mainline row,
+                // so use it instead of trandate + category lead time. Everything
+                // else has no such date and stays on the derived calculation.
+                //
+                // custbody_promisedate is deliberately NOT used: it is a rigid
+                // trandate+4 on 119 of 122 OEM orders and has corrupt values on 3,
+                // so it carries no real scheduling intent.
+                var tabKey = tabForCategory(r.cat_id);
+                if (tabKey === 'OEM') {
+                    var actual = parseNsDate(r.exp_ship);
+                    if (actual) {
+                        due = actual;
+                        dueSource = 'actual';
+                    }
+                }
 
                 orders[soId] = {
                     id: r.so_id,
                     num: r.so_num,
                     tranDate: td,
                     dueDate: due,
+                    dueSource: dueSource,
                     leadDays: lead,
                     catId: r.cat_id,
+                    tab: tabKey,
                     daysLate: due ? daysBetween(due, today) : 0,
                     custNum: r.cust_num,
                     custName: r.cust_name || ('Customer ' + r.cust_num),
@@ -363,53 +603,191 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
 
     function renderStyles() {
         var W = '#' + WRAP;
+
+        // ANDON BOARD
+        // -------------------------------------------------------------------
+        // This is a shop-floor signal display, not a report. The palette is the
+        // one already used on the floor -- green run / amber caution / red stop --
+        // so a status reads the same here as it does on the line.
+        //
+        // Type: Arial Narrow for labels and column heads (dense, industrial,
+        // present on every Windows box, no webfont to load inside NetSuite),
+        // system UI for body, tabular figures everywhere numbers are compared
+        // down a column.
+        var INK    = '#161b22';   // graphite
+        var STEEL  = '#2b3a4a';   // header bar
+        var MIST   = '#eef1f5';   // board background
+        var EDGE   = '#d5dbe3';   // hairlines
+        var DIM    = '#6b7885';   // secondary text
+
+        var GO     = '#1b7f4b';   // ship now
+        var BUILD  = '#1f5f9e';   // build now
+        var CAUT   = '#a86a00';   // partial
+        var HOLD   = '#5b3f96';   // on a WO
+        var STOP   = '#b3241f';   // blocked
+
+        var NARROW = "'Arial Narrow','Roboto Condensed',Arial,sans-serif";
+        var BODY   = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif";
+
         return '<style>' +
-            // Hide only NetSuite's page-title band. Nothing else is touched.
             '.uir-page-title{display:none}' +
 
-            W + '{font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#222;' +
-                'background:#f7f7f9;padding:14px;border-radius:6px;box-sizing:border-box;width:100%}' +
+            W + '{font-family:' + BODY + ';font-size:12px;color:' + INK + ';' +
+                'background:' + MIST + ';padding:0 0 18px 0;width:100%;box-sizing:border-box;' +
+                '-webkit-font-smoothing:antialiased}' +
             W + ' *{box-sizing:border-box}' +
-            W + ' .hd{font-size:17px;font-weight:bold;margin:0 0 2px 0}' +
-            W + ' .sub{color:#666;font-size:11px;margin-bottom:12px}' +
-            W + ' .cards{display:flex;gap:9px;margin-bottom:12px;flex-wrap:wrap}' +
-            W + ' .card{background:#fff;border:1px solid #ddd;border-radius:5px;padding:8px 13px;min-width:100px}' +
-            W + ' .card .n{font-size:20px;font-weight:bold;line-height:1.1}' +
-            W + ' .card .l{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.4px}' +
-            W + ' .bar{background:#fff;border:1px solid #ddd;border-radius:5px;padding:8px 11px;margin-bottom:11px}' +
-            W + ' .bar label{margin-right:6px;font-weight:bold}' +
-            W + ' .bar select,' + W + ' .bar input[type=text]{padding:4px;margin-right:14px;' +
-                'border:1px solid #ccc;border-radius:3px;font-size:12px}' +
-            W + ' table.grid{width:100%;border-collapse:collapse;background:#fff;border:1px solid #ddd}' +
-            W + ' table.grid th{background:#1f3864;color:#fff;text-align:left;padding:7px 9px;' +
-                'font-size:11px;text-transform:uppercase;letter-spacing:.3px}' +
-            W + ' table.grid td{padding:7px 9px;border-top:1px solid #eee;vertical-align:top;background:#fff}' +
+            W + ' .num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}' +
+
+
+
+            // ---- tabs -------------------------------------------------------
+            W + ' .tabs{display:flex;gap:0;background:' + STEEL + ';padding:0 18px;align-items:center}' +
+            W + ' .tabs .asof{margin-left:auto;font-size:10.5px;color:#8d9dae;letter-spacing:.02em}' +
+            W + ' .tab{padding:9px 20px 8px 20px;cursor:pointer;font-family:' + NARROW + ';' +
+                'font-size:14px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;' +
+                'color:#93a3b4;border-bottom:3px solid transparent;user-select:none;' +
+                'transition:color .12s,border-color .12s}' +
+            W + ' .tab:hover{color:#dbe4ee}' +
+            W + ' .tab.on{color:#fff;border-bottom-color:#fff}' +
+            W + ' .tab .tc{margin-left:8px;font-size:11px;color:#7d8d9e;font-weight:600}' +
+            W + ' .tab.on .tc{color:#c6d4e2}' +
+            W + ' .tab.warnTab{color:#e0a3a0}' +
+            W + ' .tab.warnTab.on{color:#fff;border-bottom-color:' + STOP + '}' +
+
+            // ---- signal row (stat chips double as filters) --------------------
+            W + ' .signals{display:flex;gap:0;background:#fff;border-bottom:1px solid ' + EDGE + '}' +
+            W + ' .sig{flex:1;padding:11px 14px 10px 14px;cursor:pointer;border-right:1px solid ' + EDGE + ';' +
+                'border-top:3px solid transparent;position:relative;transition:background .12s}' +
+            W + ' .sig:last-child{border-right:none}' +
+            W + ' .sig:hover{background:#f5f8fb}' +
+            W + ' .sig.on{background:#f0f5fa;border-top-color:currentColor}' +
+            W + ' .sig .v{font-size:23px;font-weight:600;line-height:1;letter-spacing:-.02em}' +
+            W + ' .sig .k{font-family:' + NARROW + ';font-size:11px;letter-spacing:.09em;' +
+                'text-transform:uppercase;color:' + DIM + ';margin-top:4px;display:flex;' +
+                'align-items:center;gap:5px}' +
+            W + ' .sig .dot{width:7px;height:7px;border-radius:50%;background:currentColor;' +
+                'display:inline-block;flex:none}' +
+
+            // ---- control bar --------------------------------------------------
+            W + ' .bar{background:#fff;border-bottom:1px solid ' + EDGE + ';padding:9px 18px;' +
+                'display:flex;align-items:center;gap:10px;flex-wrap:wrap}' +
+            W + ' .bar .lab{font-family:' + NARROW + ';font-size:11px;letter-spacing:.09em;' +
+                'text-transform:uppercase;color:' + DIM + '}' +
+            W + ' .bar input[type=text]{padding:5px 9px;border:1px solid ' + EDGE + ';border-radius:3px;' +
+                'font-size:12px;font-family:' + BODY + ';width:250px;background:#fbfcfd}' +
+            W + ' .bar input[type=text]:focus{outline:2px solid ' + BUILD + ';outline-offset:-1px;background:#fff}' +
+            W + ' .bar .spacer{margin-left:auto;font-size:11px;color:' + DIM + '}' +
+            W + ' .bar .spacer b{color:' + INK + ';font-weight:600}' +
+            W + ' .chk{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px}' +
+            W + ' .clear{border:none;background:none;color:' + BUILD + ';cursor:pointer;font-size:11px;' +
+                'padding:3px 6px;text-decoration:underline}' +
+
+            // ---- board ---------------------------------------------------------
+            W + ' table.grid{width:100%;border-collapse:collapse;background:#fff}' +
+            W + ' table.grid th{background:#fbfcfd;color:' + DIM + ';text-align:left;' +
+                'padding:8px 10px;font-family:' + NARROW + ';font-size:11px;font-weight:700;' +
+                'text-transform:uppercase;letter-spacing:.09em;border-bottom:1px solid ' + EDGE + ';' +
+                'position:sticky;top:0;z-index:2}' +
+            W + ' table.grid td{padding:9px 10px;border-bottom:1px solid #eef1f4;vertical-align:top}' +
             W + ' tr.ord{cursor:pointer}' +
-            W + ' tr.ord:hover td{background:#f0f4fb}' +
+            W + ' tr.ord:hover td{background:#f6f9fc}' +
+            W + ' tr.ord td.edge{padding:0;width:4px;border-bottom:none}' +
+            W + ' .edgebar{display:block;width:4px;height:100%;min-height:38px;background:currentColor}' +
+
+            // status colour carriers -- set once on the row, inherited by dot+edge
+            W + ' .c-SHIP{color:' + GO + '}' +
+            W + ' .c-BUILD{color:' + BUILD + '}' +
+            W + ' .c-PARTIAL{color:' + CAUT + '}' +
+            W + ' .c-WO{color:' + HOLD + '}' +
+            W + ' .c-BLOCKED{color:' + STOP + '}' +
+
+            // Filled bubbles: colour-as-background reads faster across a dense
+            // board than a dot beside text.
+            W + ' .pill{display:inline-block;padding:3px 10px;border-radius:11px;' +
+                'font-size:10.5px;font-weight:700;letter-spacing:.02em;white-space:nowrap;' +
+                'line-height:1.5}' +
+            W + ' .st-ship{background:#dcf0e4;color:#12633a}' +
+            W + ' .st-build{background:#dde9f7;color:#164a7d}' +
+            W + ' .st-part{background:#fbecd0;color:#835200}' +
+            W + ' .st-wo{background:#e6e0f5;color:#483179}' +
+            W + ' .st-block{background:#f9dedd;color:#8e1c18}' +
+
+            W + ' .so{font-weight:600;color:' + BUILD + ';font-size:12.5px}' +
+            W + ' .cust{font-size:12px}' +
+            W + ' .muted{color:' + DIM + ';font-size:10.5px;letter-spacing:.01em}' +
+
+            // days late as a magnitude, not just a red number
+            W + ' .late{font-weight:600;font-size:13px}' +
+            W + ' .l0{color:' + DIM + ';font-weight:400}' +
+            W + ' .l1{color:' + CAUT + '}' +
+            W + ' .l2{color:#c2451c}' +
+            W + ' .l3{color:' + STOP + '}' +
+            W + ' .l3:after{content:"";display:inline-block;width:5px;height:5px;border-radius:50%;' +
+                'background:' + STOP + ';margin-left:5px;vertical-align:middle}' +
+
+            W + ' .dueact{color:' + BUILD + ';font-size:10px;font-weight:700;font-family:' + NARROW + ';' +
+                'letter-spacing:.07em;text-transform:uppercase;cursor:help}' +
+
+            // notes: quiet by default, readable when present
+            W + ' .notecell{max-width:340px}' +
+            W + ' .noteflag{display:block;font-size:11px;line-height:1.45;color:#4a5560;' +
+                'border-left:2px solid #e0c86a;padding-left:8px;cursor:help}' +
+            W + ' .nonote{color:#c3cad2}' +
+
+            // ---- drill-down -----------------------------------------------------
             W + ' tr.det{display:none}' +
             W + ' tr.det.open{display:table-row}' +
-            W + ' tr.det td{background:#fafbfd}' +
-            W + ' .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;' +
-                'font-weight:bold;white-space:nowrap}' +
-            W + ' .st-ship{background:#d5f0dd;color:#12632f}' +
-            W + ' .st-build{background:#d9e8fb;color:#12457f}' +
-            W + ' .st-part{background:#fdeecd;color:#8a5a00}' +
-            W + ' .st-wo{background:#e7e0f7;color:#4b2e83}' +
-            W + ' .st-block{background:#fbdada;color:#9a1c1c}' +
-            W + ' .late{color:#c00;font-weight:bold}' +
-            W + ' .ontime{color:#666}' +
-            W + ' .notes{background:#fffbe6;border-left:3px solid #e8c14a;padding:6px 9px;' +
-                'margin:5px 0;font-size:11px;white-space:pre-wrap}' +
-            W + ' table.inner{width:100%;border-collapse:collapse;border:none}' +
-            W + ' table.inner th{background:#e9ecf3;color:#333;font-size:10px;text-align:left;padding:5px 8px}' +
-            W + ' table.inner td{border-top:1px solid #eee;font-size:11px;padding:5px 8px;background:transparent}' +
-            W + ' a{color:#1f3864;text-decoration:none}' +
+            W + ' tr.det > td{background:#f7fafc;border-bottom:2px solid ' + EDGE + ';padding:0}' +
+            W + ' .drill{padding:12px 14px 14px 14px}' +
+            W + ' .notes{background:#fffdf5;border-left:3px solid #e0c86a;padding:8px 11px;' +
+                'margin:0 0 11px 0;font-size:11.5px;line-height:1.5;white-space:pre-wrap;color:#4a4128}' +
+            W + ' .notes b{font-family:' + NARROW + ';text-transform:uppercase;letter-spacing:.07em;' +
+                'color:#8a7420;display:block;margin-bottom:3px;font-size:10.5px}' +
+            W + ' table.inner{width:100%;border-collapse:collapse;background:#fff;' +
+                'border:1px solid ' + EDGE + '}' +
+            W + ' table.inner th{background:#fbfcfd;color:' + DIM + ';font-family:' + NARROW + ';' +
+                'font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;text-align:left;' +
+                'padding:6px 9px;border-bottom:1px solid ' + EDGE + ';position:static}' +
+            W + ' table.inner td{border-bottom:1px solid #f0f3f6;font-size:11.5px;padding:7px 9px}' +
+            W + ' table.inner tr:last-child td{border-bottom:none}' +
+            W + ' .item{font-family:ui-monospace,Consolas,Monaco,monospace;font-size:11.5px;' +
+                'color:' + BUILD + ';font-weight:600}' +
+            W + ' .linememo{color:' + DIM + ';font-size:10.5px;padding-top:0!important;' +
+                'border-bottom:1px solid #f0f3f6}' +
+
+            // ---- SIGNATURE: supply meter ------------------------------------------
+            // Proportional bar of how a line gets covered: on-hand, build capacity,
+            // shortfall. Same visual grammar as the andon colours above.
+            W + ' .meter{display:flex;height:7px;width:118px;border-radius:2px;overflow:hidden;' +
+                'background:#e9edf1;margin-bottom:3px}' +
+            W + ' .meter span{display:block;height:100%}' +
+            W + ' .m-stock{background:' + GO + '}' +
+            W + ' .m-build{background:' + BUILD + '}' +
+            W + ' .m-short{background:' + STOP + '}' +
+            W + ' .mkey{font-size:10px;color:' + DIM + ';letter-spacing:.01em;white-space:nowrap}' +
+            W + ' .mkey b{font-weight:600;color:' + INK + '}' +
+
+            W + ' .wocell{font-size:11px;color:' + HOLD + ';font-weight:600}' +
+            W + ' .wonone{color:#c3cad2;font-size:11px}' +
+
+            // ---- empty state --------------------------------------------------------
+            W + ' .empty{padding:44px 18px;text-align:center;color:' + DIM + ';background:#fff}' +
+            W + ' .empty .big{font-family:' + NARROW + ';font-size:17px;letter-spacing:.06em;' +
+                'text-transform:uppercase;color:' + INK + ';margin-bottom:5px}' +
+
+            W + ' a{color:' + BUILD + ';text-decoration:none}' +
             W + ' a:hover{text-decoration:underline}' +
-            W + ' .mono{font-family:Consolas,Monaco,monospace}' +
-            W + ' .warn{background:#fff4f4;border:1px solid #f0c4c4;border-radius:5px;' +
-                'padding:8px 12px;margin-bottom:11px;font-size:11px;color:#7a2020}' +
-            W + ' .caret{display:inline-block;width:10px;color:#888}' +
-            W + ' .muted{color:#999;font-size:10px}' +
+            W + ' a:focus-visible,' + W + ' .tab:focus-visible,' + W + ' .sig:focus-visible{' +
+                'outline:2px solid ' + BUILD + ';outline-offset:1px}' +
+
+            '@media (max-width:900px){' +
+              W + ' .signals{flex-wrap:wrap}' +
+              W + ' .sig{flex:1 0 33%;border-top-width:2px}' +
+              W + ' .notecell{max-width:180px}' +
+            '}' +
+            '@media (prefers-reduced-motion:reduce){' +
+              W + ' *{transition:none!important;animation:none!important}' +
+            '}' +
             '</style>';
     }
 
@@ -436,14 +814,26 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             '  if(c)c.innerHTML=open?"\\u25BC":"\\u25B6";' +
             ' };' +
 
+            ' GYHBO.tab=null;' +
+
+            // Filters on tab first, then status/search/past-due. Stat cards are
+            // recomputed from whatever survives, so each tab reads as its own
+            // report rather than showing account-wide totals.
             ' GYHBO.filter=function(){' +
             '  var s=root.querySelector("#"+W+"-st").value;' +
             '  var q=root.querySelector("#"+W+"-q").value.toLowerCase();' +
             '  var late=root.querySelector("#"+W+"-late").checked;' +
             '  var rows=root.querySelectorAll("tr.ord");' +
             '  var shown=0;' +
+            '  var st={TOTAL:0,LATE:0,SHIP:0,BUILD:0,PARTIAL:0,WO:0,BLOCKED:0};' +
             '  for(var i=0;i<rows.length;i++){' +
             '   var r=rows[i],ok=true;' +
+            '   if(GYHBO.tab&&r.getAttribute("data-tab")!==GYHBO.tab)ok=false;' +
+            '   if(ok){' +
+            '    st.TOTAL++;' +
+            '    if(r.getAttribute("data-late")==="1")st.LATE++;' +
+            '    var k=r.getAttribute("data-st");if(st.hasOwnProperty(k))st[k]++;' +
+            '   }' +
             '   if(s&&r.getAttribute("data-st")!==s)ok=false;' +
             '   if(late&&r.getAttribute("data-late")!=="1")ok=false;' +
             '   if(q&&r.getAttribute("data-search").indexOf(q)<0)ok=false;' +
@@ -453,12 +843,51 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             '   if(d&&!ok)d.classList.remove("open");' +
             '   if(ok)shown++;' +
             '  }' +
+            '  var cards=root.querySelectorAll("[data-stat]");' +
+            '  for(var j=0;j<cards.length;j++){' +
+            '   var key=cards[j].getAttribute("data-stat");' +
+            '   cards[j].textContent=st.hasOwnProperty(key)?st[key]:0;' +
+            '  }' +
+            '  var sigs=root.querySelectorAll(".sig");' +
+            '  for(var m=0;m<sigs.length;m++){' +
+            '   var fv=sigs[m].getAttribute("data-filter");' +
+            '   var act=(fv==="__LATE__")?(late&&!s):(fv?(s===fv&&!late):(!s&&!late));' +
+            '   sigs[m].classList.toggle("on",!!act);' +
+            '  }' +
+            '  var er=root.querySelector("#"+W+"-empty");' +
+            '  if(er)er.style.display=shown?"none":"";' +
             '  root.querySelector("#"+W+"-cnt").textContent=shown;' +
+            ' };' +
+
+            ' GYHBO.applySignal=function(f){' +
+            '  var sel=root.querySelector("#"+W+"-st");' +
+            '  var lt=root.querySelector("#"+W+"-late");' +
+            '  if(f==="__LATE__"){sel.value="";lt.checked=!lt.checked;}' +
+            '  else if(!f){sel.value="";lt.checked=false;}' +
+            '  else {lt.checked=false;sel.value=(sel.value===f)?"":f;}' +
+            '  GYHBO.filter();' +
+            ' };' +
+
+            ' GYHBO.setTab=function(key){' +
+            '  GYHBO.tab=key;' +
+            '  var ts=root.querySelectorAll(".tab");' +
+            '  for(var i=0;i<ts.length;i++){' +
+            '   ts[i].classList.toggle("on",ts[i].getAttribute("data-tab")===key);' +
+            '  }' +
+            '  GYHBO.filter();' +
             ' };' +
 
             ' root.addEventListener("click",function(e){' +
             '  var a=e.target.closest?e.target.closest("a"):null;' +
             '  if(a)return;' +
+            '  var tb=e.target.closest?e.target.closest(".tab"):null;' +
+            '  if(tb){GYHBO.setTab(tb.getAttribute("data-tab"));return;}' +
+            '  var sg=e.target.closest?e.target.closest(".sig"):null;' +
+            '  if(sg){GYHBO.applySignal(sg.getAttribute("data-filter"));return;}' +
+            '  var cl=e.target.closest?e.target.closest(".clear"):null;' +
+            '  if(cl){var sel=root.querySelector("#"+W+"-st");sel.value="";' +
+            '   root.querySelector("#"+W+"-late").checked=false;' +
+            '   root.querySelector("#"+W+"-q").value="";GYHBO.filter();return;}' +
             '  var tr=e.target.closest?e.target.closest("tr.ord"):null;' +
             '  if(tr)GYHBO.toggle(tr.getAttribute("data-id"));' +
             ' });' +
@@ -469,36 +898,75 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
             ' if(st)st.addEventListener("change",GYHBO.filter);' +
             ' if(q)q.addEventListener("keyup",GYHBO.filter);' +
             ' if(lt)lt.addEventListener("change",GYHBO.filter);' +
+            ' root.addEventListener("keydown",function(e){' +
+            '  if(e.key!=="Enter"&&e.key!==" ")return;' +
+            '  var t=e.target.closest?e.target.closest(".sig,.tab"):null;' +
+            '  if(!t)return;' +
+            '  e.preventDefault();' +
+            '  if(t.classList.contains("sig"))GYHBO.applySignal(t.getAttribute("data-filter"));' +
+            '  else GYHBO.setTab(t.getAttribute("data-tab"));' +
+            ' });' +
+            ' var on=root.querySelector(".tab.on");' +
+            ' GYHBO.setTab(on?on.getAttribute("data-tab"):null);' +
             '})();' +
             '</script>';
     }
 
+    /**
+     * Line table for the drill-down.
+     *
+     * The supply meter is the point of this view: one proportional bar per line
+     * showing how the demand is covered -- green from stock on the shelf, blue
+     * from remaining build capacity, red not covered at all. Because capacity is
+     * netted across orders before this renders, a red segment means the parts are
+     * genuinely spoken for by an earlier-due order, not merely "low".
+     */
     function renderLineTable(o) {
         var h = '<table class="inner"><tr>' +
-            '<th>Item</th><th>Need</th><th>From stock</th><th>Build</th>' +
-            '<th>Short</th><th>On hand</th><th>Max build</th><th>Printed WOs</th><th>Status</th>' +
+            '<th>Item</th><th>Need</th><th>Coverage</th>' +
+            '<th>On hand</th><th>Max build</th><th>Printed WOs</th><th>Status</th>' +
             '</tr>';
 
         o.lines.forEach(function (ln) {
-            var woTxt = '&mdash;';
-            if (ln.wo && ln.wo.qty > 0) {
-                woTxt = ln.wo.count + ' WO' + (ln.wo.count > 1 ? 's' : '') +
-                        ' &middot; ' + ln.wo.qty + ' pcs';
-            }
-            h += '<tr>' +
-                '<td><a href="' + itemUrl(ln.itemId) + '" target="_blank" class="mono">' + esc(ln.itemName) + '</a></td>' +
-                '<td>' + ln.qtyOpen + '</td>' +
-                '<td>' + (ln.fromStock || '&mdash;') + '</td>' +
-                '<td>' + (ln.fromBuild || '&mdash;') + '</td>' +
-                '<td>' + (ln.shortfall ? '<span class="late">' + ln.shortfall + '</span>' : '&mdash;') + '</td>' +
-                '<td>' + ln.qtyAvail + '</td>' +
-                '<td>' + ln.maxBuild + '</td>' +
+            var total = ln.qtyOpen || 1;
+            var pStock = Math.round((ln.fromStock / total) * 100);
+            var pBuild = Math.round((ln.fromBuild / total) * 100);
+            var pShort = Math.max(0, 100 - pStock - pBuild);
+
+            var meter = '<div class="meter" title="' +
+                ln.fromStock + ' from stock, ' + ln.fromBuild + ' to build, ' +
+                ln.shortfall + ' short">' +
+                (pStock ? '<span class="m-stock" style="width:' + pStock + '%"></span>' : '') +
+                (pBuild ? '<span class="m-build" style="width:' + pBuild + '%"></span>' : '') +
+                (pShort ? '<span class="m-short" style="width:' + pShort + '%"></span>' : '') +
+                '</div>';
+
+            // Only name the segments that actually exist -- a key listing zeroes
+            // is noise on a board people scan quickly.
+            var parts = [];
+            if (ln.fromStock) parts.push('<b>' + ln.fromStock + '</b> stock');
+            if (ln.fromBuild) parts.push('<b>' + ln.fromBuild + '</b> build');
+            if (ln.shortfall) parts.push('<b style="color:#b3241f">' + ln.shortfall + '</b> short');
+            var key = '<div class="mkey">' + (parts.join(' &middot; ') || '&mdash;') + '</div>';
+
+            var woTxt = (ln.wo && ln.wo.qty > 0)
+                ? '<span class="wocell">' + ln.wo.qty + ' pcs' +
+                  '<span class="muted"> / ' + ln.wo.count + ' WO' + (ln.wo.count > 1 ? 's' : '') + '</span></span>'
+                : '<span class="wonone">none</span>';
+
+            h += '<tr class="c-' + ln.status.key + '">' +
+                '<td><a class="item" href="' + itemUrl(ln.itemId) + '" target="_blank">' +
+                    esc(ln.itemName) + '</a></td>' +
+                '<td class="num">' + ln.qtyOpen + '</td>' +
+                '<td>' + meter + key + '</td>' +
+                '<td class="num">' + ln.qtyAvail + '</td>' +
+                '<td class="num">' + ln.maxBuild + '</td>' +
                 '<td>' + woTxt + '</td>' +
                 '<td><span class="pill ' + ln.status.css + '">' + ln.status.label + '</span></td>' +
                 '</tr>';
 
             if (ln.memo) {
-                h += '<tr><td colspan="9" class="muted" style="padding-top:0">' + esc(ln.memo) + '</td></tr>';
+                h += '<tr><td colspan="7" class="linememo">' + esc(ln.memo) + '</td></tr>';
             }
         });
 
@@ -520,74 +988,117 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
         var h = renderStyles();
         h += '<div id="' + WRAP + '">';
 
-        h += '<div class="hd">Unshipped Orders &mdash; Can We Build It?</div>';
-        h += '<div class="sub">GEN-Y HITCH location only &middot; open SOs (status A/B/D/E) &middot; ' +
-             'supply netted across orders by due date &middot; generated ' + fmtDate(new Date()) + '</div>';
+        // Tab bar. Counts are per-tab so each reads as its own report.
+        var tabCounts = {};
+        orders.forEach(function (o) { tabCounts[o.tab] = (tabCounts[o.tab] || 0) + 1; });
 
-        h += '<div class="warn"><b>Reading the WO column:</b> open work orders are filtered to those with a ' +
-             'printed job traveler. It reports how much is on the floor, not a completion date &mdash; ' +
-             '92% of open WO end dates are already in the past, so those dates are not a reliable ETA.</div>';
+        var activeTab = null;
+        var visibleTabs = TABS.filter(function (t) {
+            return !t.onlyIfPopulated || (tabCounts[t.key] || 0) > 0;
+        });
+        visibleTabs.forEach(function (t) {
+            if (!activeTab && (tabCounts[t.key] || 0) > 0) activeTab = t.key;
+        });
+        if (!activeTab && visibleTabs.length) activeTab = visibleTabs[0].key;
 
-        h += '<div class="cards">' +
-            '<div class="card"><div class="n">' + orders.length + '</div><div class="l">Orders</div></div>' +
-            '<div class="card"><div class="n" style="color:#c00">' + lateCt + '</div><div class="l">Past due</div></div>' +
-            '<div class="card"><div class="n" style="color:#12632f">' + counts.SHIP + '</div><div class="l">Ship now</div></div>' +
-            '<div class="card"><div class="n" style="color:#12457f">' + counts.BUILD + '</div><div class="l">Build now</div></div>' +
-            '<div class="card"><div class="n" style="color:#8a5a00">' + counts.PARTIAL + '</div><div class="l">Partial</div></div>' +
-            '<div class="card"><div class="n" style="color:#4b2e83">' + counts.WO + '</div><div class="l">On a WO</div></div>' +
-            '<div class="card"><div class="n" style="color:#9a1c1c">' + counts.BLOCKED + '</div><div class="l">Blocked</div></div>' +
-            '</div>';
+        h += '<div class="tabs">';
+        visibleTabs.forEach(function (t) {
+            h += '<div class="tab' + (t.key === activeTab ? ' on' : '') +
+                 (t.key === 'UNASSIGNED' ? ' warnTab' : '') +
+                 '" data-tab="' + t.key + '" tabindex="0">' + esc(t.label) +
+                 '<span class="tc">' + (tabCounts[t.key] || 0) + '</span></div>';
+        });
+        h += '<span class="asof">GEN-Y HITCH &middot; as of ' + fmtDate(new Date()) + '</span>';
+        h += '</div>';
+
+        // Signal chips double as the status filter -- clicking one is the same as
+        // choosing it from a dropdown, which is the action people actually want
+        // after reading the number.
+        var SIGS = [
+            { k: 'TOTAL',   label: 'Orders',    cls: '',          filter: ''        },
+            { k: 'LATE',    label: 'Past due',  cls: 'c-BLOCKED', filter: '__LATE__' },
+            { k: 'SHIP',    label: 'Ship now',  cls: 'c-SHIP',    filter: 'SHIP'    },
+            { k: 'BUILD',   label: 'Build now', cls: 'c-BUILD',   filter: 'BUILD'   },
+            { k: 'PARTIAL', label: 'Partial',   cls: 'c-PARTIAL', filter: 'PARTIAL' },
+            { k: 'WO',      label: 'On a WO',   cls: 'c-WO',      filter: 'WO'      },
+            { k: 'BLOCKED', label: 'Blocked',   cls: 'c-BLOCKED', filter: 'BLOCKED' }
+        ];
+
+        h += '<div class="signals">';
+        SIGS.forEach(function (g) {
+            h += '<div class="sig ' + g.cls + '" data-filter="' + g.filter + '" tabindex="0">' +
+                 '<div class="v num" data-stat="' + g.k + '">0</div>' +
+                 '<div class="k">' + (g.cls ? '<span class="dot"></span>' : '') + esc(g.label) + '</div>' +
+                 '</div>';
+        });
+        h += '</div>';
 
         h += '<div class="bar">' +
-            '<label>Status</label><select id="' + WRAP + '-st">' +
-            '<option value="">All</option>' +
-            '<option value="SHIP">Ship now</option>' +
-            '<option value="BUILD">Build now</option>' +
-            '<option value="PARTIAL">Partial</option>' +
-            '<option value="WO">On a WO</option>' +
-            '<option value="BLOCKED">Blocked</option>' +
-            '</select>' +
-            '<label>Search</label>' +
-            '<input id="' + WRAP + '-q" type="text" placeholder="SO#, customer, item" size="26">' +
-            '<label><input id="' + WRAP + '-late" type="checkbox"> Past due only</label>' +
-            '<span style="float:right;color:#666">Showing <b id="' + WRAP + '-cnt">' + orders.length + '</b></span>' +
+            '<input id="' + WRAP + '-q" type="text" placeholder="Search order, customer, item or note">' +
+            '<label class="chk"><input id="' + WRAP + '-late" type="checkbox"> <span>Past due only</span></label>' +
+            '<button type="button" class="clear" id="' + WRAP + '-clear">Reset filters</button>' +
+            '<select id="' + WRAP + '-st" style="display:none"><option value=""></option>' +
+            '<option value="SHIP"></option><option value="BUILD"></option>' +
+            '<option value="PARTIAL"></option><option value="WO"></option>' +
+            '<option value="BLOCKED"></option></select>' +
+            '<span class="spacer">Showing <b id="' + WRAP + '-cnt" class="num">' + orders.length + '</b></span>' +
             '</div>';
 
         h += '<table class="grid"><tr>' +
+            '<th style="width:4px;padding:0"></th>' +
             '<th style="width:16px"></th><th>Order</th><th>Customer</th><th>Ordered</th>' +
-            '<th>Due</th><th>Days late</th><th>Lines</th><th>Status</th>' +
+            '<th>Due</th><th>Late</th><th>Lines</th><th>Status</th><th>Order notes</th>' +
             '</tr>';
 
         orders.forEach(function (o) {
-            var search = (String(o.num) + ' ' + o.custName + ' ' + o.custNum + ' ' +
+            var search = (String(o.num) + ' ' + o.custName + ' ' + o.custNum + ' ' + o.notes + ' ' +
                           o.lines.map(function (l) { return l.itemName; }).join(' ')).toLowerCase();
 
-            var lateCell = o.daysLate > 0
-                ? '<span class="late">' + o.daysLate + '</span>'
-                : '<span class="ontime">' + o.daysLate + '</span>';
+            // Severity band for days late: 0 / 1-7 / 8-30 / 30+. Encodes how bad,
+            // not just that it is bad.
+            var lateCls = o.daysLate <= 0 ? 'l0'
+                        : o.daysLate <= 7 ? 'l1'
+                        : o.daysLate <= 30 ? 'l2' : 'l3';
 
-            h += '<tr class="ord" data-id="' + o.id + '" data-st="' + o.status.key + '" ' +
+            h += '<tr class="ord c-' + o.status.key + '" data-id="' + o.id + '" data-st="' + o.status.key + '" ' +
+                 'data-tab="' + o.tab + '" ' +
                  'data-late="' + (o.daysLate > 0 ? '1' : '0') + '" ' +
                  'data-search="' + esc(search) + '">' +
+                '<td class="edge"><span class="edgebar"></span></td>' +
                 '<td><span class="caret" data-for="' + o.id + '">&#9654;</span></td>' +
-                '<td><a href="' + soUrl(o.id) + '" target="_blank">' + esc(o.num) + '</a></td>' +
-                '<td>' + esc(o.custName) + '<div class="muted">' + esc(o.custNum) + '</div></td>' +
-                '<td>' + fmtDate(o.tranDate) + '</td>' +
-                '<td>' + fmtDate(o.dueDate) + '<div class="muted">+' + o.leadDays + 'd</div></td>' +
-                '<td>' + lateCell + '</td>' +
-                '<td>' + o.lines.length + (o.blockedLines ? ' <span style="color:#c00">(' + o.blockedLines + ')</span>' : '') + '</td>' +
+                '<td><a class="so" href="' + soUrl(o.id) + '" target="_blank">' + esc(o.num) + '</a></td>' +
+                '<td><div class="cust">' + esc(o.custName) + '</div><div class="muted">' + esc(o.custNum) + '</div></td>' +
+                '<td class="num">' + fmtDate(o.tranDate) + '</td>' +
+                '<td class="num">' + fmtDate(o.dueDate) +
+                    (o.dueSource === 'actual'
+                        ? '<div class="dueact" title="Scheduled ship date from the order">scheduled</div>'
+                        : '<div class="muted">+' + o.leadDays + 'd lead</div>') + '</td>' +
+                '<td class="num"><span class="late ' + lateCls + '">' +
+                    (o.daysLate > 0 ? o.daysLate : '&mdash;') + '</span></td>' +
+                '<td class="num">' + o.lines.length +
+                    (o.blockedLines ? ' <span class="muted" style="color:#b3241f">' +
+                     o.blockedLines + ' short</span>' : '') + '</td>' +
                 '<td><span class="pill ' + o.status.css + '">' + o.status.label + '</span></td>' +
+                '<td class="notecell">' +
+                    (o.notes
+                        ? '<span class="noteflag" title="' + esc(o.notes) + '">' +
+                          esc(clip(o.notes, 90)) + '</span>'
+                        : '<span class="nonote">&mdash;</span>') +
+                '</td>' +
                 '</tr>';
 
-            h += '<tr class="det" data-for="' + o.id + '"><td></td><td colspan="7">';
+            h += '<tr class="det" data-for="' + o.id + '"><td colspan="10"><div class="drill">';
             if (o.notes) {
-                h += '<div class="notes"><b>Sales team notes:</b><br>' + esc(o.notes) + '</div>';
+                h += '<div class="notes"><b>Sales team notes</b>' + esc(o.notes) + '</div>';
             }
             h += renderLineTable(o);
-            h += '</td></tr>';
+            h += '</div></td></tr>';
         });
 
         h += '</table>';
+        h += '<div class="empty" id="' + WRAP + '-empty" style="display:none">' +
+             '<div class="big">Nothing matches</div>' +
+             'Clear the search or pick a different signal above.</div>';
         h += '</div>';          // close #gyh-bo
         h += renderScript();    // runs after the wrapper exists in the DOM
 
@@ -612,9 +1123,35 @@ define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget,
         fld.updateBreakType({ breakType: serverWidget.FieldBreakType.STARTROW });
 
         try {
+            var user = runtime.getCurrentUser();
+            var ctxInfo = 'user ' + user.id + ' / role ' + user.role +
+                          ' / subsidiary ' + user.subsidiary +
+                          ' / script ' + runtime.getCurrentScript().id;
+            log.audit({ title: 'GYH_BuildableOrders_SL start', details: ctxInfo });
+
+            if (context.request.parameters.debug === 'T') {
+                fld.defaultValue = renderDebug(runProbes(), ctxInfo);
+                context.response.writePage(form);
+                return;
+            }
+
             var rows = fetchOpenLines();
+            log.audit({ title: 'fetchOpenLines', details: 'rows=' + (rows ? rows.length : 'null') });
+
             var woMap = fetchPrintedWos();
+            log.audit({ title: 'fetchPrintedWos', details: 'items=' + Object.keys(woMap).length });
+
             var orders = buildModel(rows, woMap);
+            log.audit({ title: 'buildModel', details: 'orders=' + orders.length });
+
+            if (!rows || rows.length === 0) {
+                log.error({
+                    title: 'Query returned zero rows',
+                    details: 'Same SQL returns 476 rows via an integration role. ' +
+                             'Add &debug=T to the URL to isolate which filter or table is blocked.'
+                });
+            }
+
             fld.defaultValue = renderFragment(orders);
         } catch (e) {
             log.error({ title: 'GYH_BuildableOrders_SL failed', details: e });
