@@ -8,6 +8,17 @@
  * Shows open, unshipped sales orders at the GEN-Y HITCH location and answers:
  *   "Can we build this right now, and if not, why not?"
  *
+ * RENDERING CONTRACT (do not change without reading this):
+ *   The whole dashboard is delivered as a SINGLE INLINEHTML field on a
+ *   serverWidget Form, rendered with response.writePage(). This keeps the
+ *   NetSuite header, role switcher and navigation intact. Do NOT switch back to
+ *   response.write() with raw HTML -- that produces a bare page with no chrome.
+ *
+ *   All markup lives inside #gyh-bo. Every CSS rule and every JS symbol is
+ *   scoped to that wrapper (JS via the single global GYHBO) so nothing leaks
+ *   onto, or collides with, the surrounding NetSuite page. No <html>, <head> or
+ *   <body> tags -- NetSuite supplies those.
+ *
  * Design decisions (confirmed with Lamar, Aug 2026):
  *   - Location scope ....... location ID 1 (GEN-Y HITCH) ONLY. Child locations
  *                           (Powdercoat, Amazon DC, OFFSITE vendors) excluded.
@@ -34,12 +45,13 @@
  *      Showing enddate as an ETA would be actively misleading.
  */
 
-define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWidget, runtime) {
+define(['N/query', 'N/ui/serverWidget', 'N/log'], function (query, serverWidget, log) {
 
     // ---------------------------------------------------------------- config
 
     var HITCH_LOCATION = 1;
     var ACCOUNT_ID     = '5262266';
+    var WRAP           = 'gyh-bo';   // single wrapper id -- everything scopes to this
 
     // Lead time in days by customer category ID. Source: Lamar, Aug 2026.
     // Key 0 = customer record has no category set.
@@ -74,11 +86,11 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
     var DEFAULT_LEAD_DAYS = 10;
 
     var STATUS = {
-        SHIP:    { key: 'SHIP',    label: 'Ship now',      rank: 0, css: 'st-ship'  },
-        BUILD:   { key: 'BUILD',   label: 'Build now',     rank: 1, css: 'st-build' },
-        PARTIAL: { key: 'PARTIAL', label: 'Partial',       rank: 2, css: 'st-part'  },
-        WO:      { key: 'WO',      label: 'On a WO',       rank: 3, css: 'st-wo'    },
-        BLOCKED: { key: 'BLOCKED', label: 'Blocked',       rank: 4, css: 'st-block' }
+        SHIP:    { key: 'SHIP',    label: 'Ship now',  rank: 0, css: 'st-ship'  },
+        BUILD:   { key: 'BUILD',   label: 'Build now', rank: 1, css: 'st-build' },
+        PARTIAL: { key: 'PARTIAL', label: 'Partial',   rank: 2, css: 'st-part'  },
+        WO:      { key: 'WO',      label: 'On a WO',   rank: 3, css: 'st-wo'    },
+        BLOCKED: { key: 'BLOCKED', label: 'Blocked',   rank: 4, css: 'st-block' }
     };
 
     // ----------------------------------------------------------------- utils
@@ -116,15 +128,15 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
     }
 
     function soUrl(id) {
-        return 'https://' + ACCOUNT_ID + '.app.netsuite.com/app/accounting/transactions/salesord.nl?id=' + id;
+        return '/app/accounting/transactions/salesord.nl?id=' + id;
     }
 
     function woUrl(id) {
-        return 'https://' + ACCOUNT_ID + '.app.netsuite.com/app/accounting/transactions/workord.nl?id=' + id;
+        return '/app/accounting/transactions/workord.nl?id=' + id;
     }
 
     function itemUrl(id) {
-        return 'https://' + ACCOUNT_ID + '.app.netsuite.com/app/common/item/item.nl?id=' + id;
+        return '/app/common/item/item.nl?id=' + id;
     }
 
     // ------------------------------------------------------------- data pull
@@ -274,14 +286,15 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
         });
 
         // Sort lines by their order's due date so the most urgent order draws
-        // from the shared pool first. Undated orders fall to the back.
+        // from the shared pool first. Ties break on SO number for stability --
+        // otherwise identical due dates would allocate in arbitrary query order.
         lines.sort(function (a, b) {
-            var da = orders[a.soId].dueDate;
-            var db = orders[b.soId].dueDate;
-            if (!da && !db) return 0;
-            if (!da) return 1;
-            if (!db) return -1;
-            return da.getTime() - db.getTime();
+            var oa = orders[a.soId], ob = orders[b.soId];
+            var da = oa.dueDate, db = ob.dueDate;
+            if (da && db && da.getTime() !== db.getTime()) return da.getTime() - db.getTime();
+            if (!da && db) return 1;
+            if (da && !db) return -1;
+            return String(oa.num).localeCompare(String(ob.num));
         });
 
         // Per-item supply pools, consumed as we walk the sorted lines.
@@ -344,73 +357,119 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
     }
 
     // ------------------------------------------------------------- rendering
+    //
+    // Everything below emits a fragment, never a full document. Every CSS rule
+    // is prefixed with #gyh-bo so it cannot touch NetSuite's own markup.
 
     function renderStyles() {
+        var W = '#' + WRAP;
         return '<style>' +
-            'body{font-family:Arial,Helvetica,sans-serif;font-size:12px;margin:0;padding:16px;background:#f7f7f9;color:#222}' +
-            'h1{font-size:18px;margin:0 0 2px 0}' +
-            '.sub{color:#666;font-size:11px;margin-bottom:14px}' +
-            '.cards{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}' +
-            '.card{background:#fff;border:1px solid #ddd;border-radius:5px;padding:9px 14px;min-width:104px}' +
-            '.card .n{font-size:21px;font-weight:bold;line-height:1.1}' +
-            '.card .l{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.4px}' +
-            '.bar{background:#fff;border:1px solid #ddd;border-radius:5px;padding:9px 12px;margin-bottom:12px}' +
-            '.bar label{margin-right:6px;font-weight:bold}' +
-            '.bar select,.bar input{padding:4px;margin-right:14px;border:1px solid #ccc;border-radius:3px;font-size:12px}' +
-            'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #ddd;border-radius:5px;overflow:hidden}' +
-            'th{background:#1f3864;color:#fff;text-align:left;padding:7px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.3px}' +
-            'td{padding:7px 9px;border-top:1px solid #eee;vertical-align:top}' +
-            'tr.ord{cursor:pointer}' +
-            'tr.ord:hover{background:#f0f4fb}' +
-            'tr.det{background:#fafbfd;display:none}' +
-            'tr.det.open{display:table-row}' +
-            '.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;white-space:nowrap}' +
-            '.st-ship{background:#d5f0dd;color:#12632f}' +
-            '.st-build{background:#d9e8fb;color:#12457f}' +
-            '.st-part{background:#fdeecd;color:#8a5a00}' +
-            '.st-wo{background:#e7e0f7;color:#4b2e83}' +
-            '.st-block{background:#fbdada;color:#9a1c1c}' +
-            '.late{color:#c00;font-weight:bold}' +
-            '.ontime{color:#666}' +
-            '.notes{background:#fffbe6;border-left:3px solid #e8c14a;padding:6px 9px;margin:5px 0;font-size:11px;white-space:pre-wrap}' +
-            '.inner{width:100%;border:none;background:transparent}' +
-            '.inner th{background:#e9ecf3;color:#333;font-size:10px}' +
-            '.inner td{border-top:1px solid #eee;font-size:11px}' +
-            'a{color:#1f3864}' +
-            '.mono{font-family:Consolas,Monaco,monospace}' +
-            '.warn{background:#fff4f4;border:1px solid #f0c4c4;border-radius:5px;padding:8px 12px;margin-bottom:12px;font-size:11px;color:#7a2020}' +
-            '.caret{display:inline-block;width:10px;color:#888}' +
+            // Hide only NetSuite's page-title band. Nothing else is touched.
+            '.uir-page-title{display:none}' +
+
+            W + '{font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#222;' +
+                'background:#f7f7f9;padding:14px;border-radius:6px;box-sizing:border-box;width:100%}' +
+            W + ' *{box-sizing:border-box}' +
+            W + ' .hd{font-size:17px;font-weight:bold;margin:0 0 2px 0}' +
+            W + ' .sub{color:#666;font-size:11px;margin-bottom:12px}' +
+            W + ' .cards{display:flex;gap:9px;margin-bottom:12px;flex-wrap:wrap}' +
+            W + ' .card{background:#fff;border:1px solid #ddd;border-radius:5px;padding:8px 13px;min-width:100px}' +
+            W + ' .card .n{font-size:20px;font-weight:bold;line-height:1.1}' +
+            W + ' .card .l{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.4px}' +
+            W + ' .bar{background:#fff;border:1px solid #ddd;border-radius:5px;padding:8px 11px;margin-bottom:11px}' +
+            W + ' .bar label{margin-right:6px;font-weight:bold}' +
+            W + ' .bar select,' + W + ' .bar input[type=text]{padding:4px;margin-right:14px;' +
+                'border:1px solid #ccc;border-radius:3px;font-size:12px}' +
+            W + ' table.grid{width:100%;border-collapse:collapse;background:#fff;border:1px solid #ddd}' +
+            W + ' table.grid th{background:#1f3864;color:#fff;text-align:left;padding:7px 9px;' +
+                'font-size:11px;text-transform:uppercase;letter-spacing:.3px}' +
+            W + ' table.grid td{padding:7px 9px;border-top:1px solid #eee;vertical-align:top;background:#fff}' +
+            W + ' tr.ord{cursor:pointer}' +
+            W + ' tr.ord:hover td{background:#f0f4fb}' +
+            W + ' tr.det{display:none}' +
+            W + ' tr.det.open{display:table-row}' +
+            W + ' tr.det td{background:#fafbfd}' +
+            W + ' .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;' +
+                'font-weight:bold;white-space:nowrap}' +
+            W + ' .st-ship{background:#d5f0dd;color:#12632f}' +
+            W + ' .st-build{background:#d9e8fb;color:#12457f}' +
+            W + ' .st-part{background:#fdeecd;color:#8a5a00}' +
+            W + ' .st-wo{background:#e7e0f7;color:#4b2e83}' +
+            W + ' .st-block{background:#fbdada;color:#9a1c1c}' +
+            W + ' .late{color:#c00;font-weight:bold}' +
+            W + ' .ontime{color:#666}' +
+            W + ' .notes{background:#fffbe6;border-left:3px solid #e8c14a;padding:6px 9px;' +
+                'margin:5px 0;font-size:11px;white-space:pre-wrap}' +
+            W + ' table.inner{width:100%;border-collapse:collapse;border:none}' +
+            W + ' table.inner th{background:#e9ecf3;color:#333;font-size:10px;text-align:left;padding:5px 8px}' +
+            W + ' table.inner td{border-top:1px solid #eee;font-size:11px;padding:5px 8px;background:transparent}' +
+            W + ' a{color:#1f3864;text-decoration:none}' +
+            W + ' a:hover{text-decoration:underline}' +
+            W + ' .mono{font-family:Consolas,Monaco,monospace}' +
+            W + ' .warn{background:#fff4f4;border:1px solid #f0c4c4;border-radius:5px;' +
+                'padding:8px 12px;margin-bottom:11px;font-size:11px;color:#7a2020}' +
+            W + ' .caret{display:inline-block;width:10px;color:#888}' +
+            W + ' .muted{color:#999;font-size:10px}' +
             '</style>';
     }
 
+    /**
+     * All behaviour hangs off the single global GYHBO so it cannot collide with
+     * NetSuite's own page scripts. Listeners are bound in JS -- no inline
+     * onclick attributes, which keeps this working if the account ever turns on
+     * a stricter content policy.
+     */
     function renderScript() {
         return '<script>' +
-            'function tgl(id){' +
-            ' var r=document.getElementById("d"+id);' +
-            ' var c=document.getElementById("c"+id);' +
-            ' if(!r)return;' +
-            ' r.classList.toggle("open");' +
-            ' if(c)c.innerHTML=r.classList.contains("open")?"\\u25BC":"\\u25B6";' +
-            '}' +
-            'function flt(){' +
-            ' var s=document.getElementById("fSt").value;' +
-            ' var q=document.getElementById("fQ").value.toLowerCase();' +
-            ' var late=document.getElementById("fLate").checked;' +
-            ' var rows=document.querySelectorAll("tr.ord");' +
-            ' var shown=0;' +
-            ' for(var i=0;i<rows.length;i++){' +
-            '  var r=rows[i];' +
-            '  var ok=true;' +
-            '  if(s&&r.getAttribute("data-st")!==s)ok=false;' +
-            '  if(late&&r.getAttribute("data-late")!=="1")ok=false;' +
-            '  if(q&&r.getAttribute("data-search").indexOf(q)<0)ok=false;' +
-            '  r.style.display=ok?"":"none";' +
-            '  var d=document.getElementById("d"+r.getAttribute("data-id"));' +
-            '  if(d&&!ok)d.classList.remove("open");' +
-            '  if(ok)shown++;' +
-            ' }' +
-            ' document.getElementById("cnt").textContent=shown;' +
-            '}' +
+            '(function(){' +
+            ' var W=' + JSON.stringify(WRAP) + ';' +
+            ' var root=document.getElementById(W);' +
+            ' if(!root)return;' +
+            ' var GYHBO={};' +
+            ' window.GYHBO=GYHBO;' +
+
+            ' GYHBO.toggle=function(id){' +
+            '  var r=root.querySelector(\'tr.det[data-for="\'+id+\'"]\');' +
+            '  var c=root.querySelector(\'.caret[data-for="\'+id+\'"]\');' +
+            '  if(!r)return;' +
+            '  var open=r.classList.toggle("open");' +
+            '  if(c)c.innerHTML=open?"\\u25BC":"\\u25B6";' +
+            ' };' +
+
+            ' GYHBO.filter=function(){' +
+            '  var s=root.querySelector("#"+W+"-st").value;' +
+            '  var q=root.querySelector("#"+W+"-q").value.toLowerCase();' +
+            '  var late=root.querySelector("#"+W+"-late").checked;' +
+            '  var rows=root.querySelectorAll("tr.ord");' +
+            '  var shown=0;' +
+            '  for(var i=0;i<rows.length;i++){' +
+            '   var r=rows[i],ok=true;' +
+            '   if(s&&r.getAttribute("data-st")!==s)ok=false;' +
+            '   if(late&&r.getAttribute("data-late")!=="1")ok=false;' +
+            '   if(q&&r.getAttribute("data-search").indexOf(q)<0)ok=false;' +
+            '   r.style.display=ok?"":"none";' +
+            '   var id=r.getAttribute("data-id");' +
+            '   var d=root.querySelector(\'tr.det[data-for="\'+id+\'"]\');' +
+            '   if(d&&!ok)d.classList.remove("open");' +
+            '   if(ok)shown++;' +
+            '  }' +
+            '  root.querySelector("#"+W+"-cnt").textContent=shown;' +
+            ' };' +
+
+            ' root.addEventListener("click",function(e){' +
+            '  var a=e.target.closest?e.target.closest("a"):null;' +
+            '  if(a)return;' +
+            '  var tr=e.target.closest?e.target.closest("tr.ord"):null;' +
+            '  if(tr)GYHBO.toggle(tr.getAttribute("data-id"));' +
+            ' });' +
+
+            ' var st=root.querySelector("#"+W+"-st");' +
+            ' var q=root.querySelector("#"+W+"-q");' +
+            ' var lt=root.querySelector("#"+W+"-late");' +
+            ' if(st)st.addEventListener("change",GYHBO.filter);' +
+            ' if(q)q.addEventListener("keyup",GYHBO.filter);' +
+            ' if(lt)lt.addEventListener("change",GYHBO.filter);' +
+            '})();' +
             '</script>';
     }
 
@@ -439,15 +498,18 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
                 '</tr>';
 
             if (ln.memo) {
-                h += '<tr><td colspan="9" style="color:#777;font-size:10px;padding-top:0">' +
-                     esc(ln.memo) + '</td></tr>';
+                h += '<tr><td colspan="9" class="muted" style="padding-top:0">' + esc(ln.memo) + '</td></tr>';
             }
         });
 
         return h + '</table>';
     }
 
-    function renderPage(orders) {
+    /**
+     * Returns an HTML FRAGMENT (no <html>/<body>) wrapped in #gyh-bo, suitable
+     * for an INLINEHTML field.
+     */
+    function renderFragment(orders) {
         var counts = { SHIP: 0, BUILD: 0, PARTIAL: 0, WO: 0, BLOCKED: 0 };
         var lateCt = 0;
         orders.forEach(function (o) {
@@ -455,9 +517,10 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
             if (o.daysLate > 0) lateCt++;
         });
 
-        var h = '<html><head><title>Buildable Orders</title>' + renderStyles() + '</head><body>';
+        var h = renderStyles();
+        h += '<div id="' + WRAP + '">';
 
-        h += '<h1>Unshipped Orders &mdash; Can We Build It?</h1>';
+        h += '<div class="hd">Unshipped Orders &mdash; Can We Build It?</div>';
         h += '<div class="sub">GEN-Y HITCH location only &middot; open SOs (status A/B/D/E) &middot; ' +
              'supply netted across orders by due date &middot; generated ' + fmtDate(new Date()) + '</div>';
 
@@ -476,7 +539,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
             '</div>';
 
         h += '<div class="bar">' +
-            '<label>Status</label><select id="fSt" onchange="flt()">' +
+            '<label>Status</label><select id="' + WRAP + '-st">' +
             '<option value="">All</option>' +
             '<option value="SHIP">Ship now</option>' +
             '<option value="BUILD">Build now</option>' +
@@ -484,12 +547,13 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
             '<option value="WO">On a WO</option>' +
             '<option value="BLOCKED">Blocked</option>' +
             '</select>' +
-            '<label>Search</label><input id="fQ" type="text" placeholder="SO#, customer, item" onkeyup="flt()" size="26">' +
-            '<label><input id="fLate" type="checkbox" onchange="flt()"> Past due only</label>' +
-            '<span style="float:right;color:#666">Showing <b id="cnt">' + orders.length + '</b></span>' +
+            '<label>Search</label>' +
+            '<input id="' + WRAP + '-q" type="text" placeholder="SO#, customer, item" size="26">' +
+            '<label><input id="' + WRAP + '-late" type="checkbox"> Past due only</label>' +
+            '<span style="float:right;color:#666">Showing <b id="' + WRAP + '-cnt">' + orders.length + '</b></span>' +
             '</div>';
 
-        h += '<table><tr>' +
+        h += '<table class="grid"><tr>' +
             '<th style="width:16px"></th><th>Order</th><th>Customer</th><th>Ordered</th>' +
             '<th>Due</th><th>Days late</th><th>Lines</th><th>Status</th>' +
             '</tr>';
@@ -504,19 +568,18 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
 
             h += '<tr class="ord" data-id="' + o.id + '" data-st="' + o.status.key + '" ' +
                  'data-late="' + (o.daysLate > 0 ? '1' : '0') + '" ' +
-                 'data-search="' + esc(search) + '" onclick="tgl(' + o.id + ')">' +
-                '<td><span class="caret" id="c' + o.id + '">&#9654;</span></td>' +
-                '<td><a href="' + soUrl(o.id) + '" target="_blank" onclick="event.stopPropagation()">' +
-                    esc(o.num) + '</a></td>' +
-                '<td>' + esc(o.custName) + '<div style="color:#999;font-size:10px">' + esc(o.custNum) + '</div></td>' +
+                 'data-search="' + esc(search) + '">' +
+                '<td><span class="caret" data-for="' + o.id + '">&#9654;</span></td>' +
+                '<td><a href="' + soUrl(o.id) + '" target="_blank">' + esc(o.num) + '</a></td>' +
+                '<td>' + esc(o.custName) + '<div class="muted">' + esc(o.custNum) + '</div></td>' +
                 '<td>' + fmtDate(o.tranDate) + '</td>' +
-                '<td>' + fmtDate(o.dueDate) + '<div style="color:#999;font-size:10px">+' + o.leadDays + 'd</div></td>' +
+                '<td>' + fmtDate(o.dueDate) + '<div class="muted">+' + o.leadDays + 'd</div></td>' +
                 '<td>' + lateCell + '</td>' +
                 '<td>' + o.lines.length + (o.blockedLines ? ' <span style="color:#c00">(' + o.blockedLines + ')</span>' : '') + '</td>' +
                 '<td><span class="pill ' + o.status.css + '">' + o.status.label + '</span></td>' +
                 '</tr>';
 
-            h += '<tr class="det" id="d' + o.id + '"><td></td><td colspan="7">';
+            h += '<tr class="det" data-for="' + o.id + '"><td></td><td colspan="7">';
             if (o.notes) {
                 h += '<div class="notes"><b>Sales team notes:</b><br>' + esc(o.notes) + '</div>';
             }
@@ -524,7 +587,10 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
             h += '</td></tr>';
         });
 
-        h += '</table>' + renderScript() + '</body></html>';
+        h += '</table>';
+        h += '</div>';          // close #gyh-bo
+        h += renderScript();    // runs after the wrapper exists in the DOM
+
         return h;
     }
 
@@ -533,21 +599,35 @@ define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWid
     function onRequest(context) {
         if (context.request.method !== 'GET') return;
 
+        var form = serverWidget.createForm({ title: 'Buildable Orders' });
+
+        var fld = form.addField({
+            id: 'custpage_gyh_bo_html',
+            type: serverWidget.FieldType.INLINEHTML,
+            label: ' '
+        });
+
+        // Full page width: no column, sits below any field group.
+        fld.updateLayoutType({ layoutType: serverWidget.FieldLayoutType.OUTSIDEBELOW });
+        fld.updateBreakType({ breakType: serverWidget.FieldBreakType.STARTROW });
+
         try {
             var rows = fetchOpenLines();
             var woMap = fetchPrintedWos();
             var orders = buildModel(rows, woMap);
-            context.response.write(renderPage(orders));
+            fld.defaultValue = renderFragment(orders);
         } catch (e) {
             log.error({ title: 'GYH_BuildableOrders_SL failed', details: e });
-            context.response.write(
-                '<html><body style="font-family:Arial;padding:24px">' +
-                '<h2 style="color:#9a1c1c">Report failed to run</h2>' +
+            fld.defaultValue =
+                '<div id="' + WRAP + '" style="font-family:Arial;padding:16px">' +
+                '<div style="color:#9a1c1c;font-size:15px;font-weight:bold">Report failed to run</div>' +
                 '<p>' + esc(e.message || e) + '</p>' +
-                '<pre style="background:#f4f4f4;padding:12px;font-size:11px">' + esc(e.stack || '') + '</pre>' +
-                '</body></html>'
-            );
+                '<pre style="background:#f4f4f4;padding:12px;font-size:11px;white-space:pre-wrap">' +
+                esc(e.stack || '') + '</pre></div>';
         }
+
+        // writePage keeps the NetSuite header, role switcher and navigation.
+        context.response.writePage(form);
     }
 
     return { onRequest: onRequest };
