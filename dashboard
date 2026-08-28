@@ -1,0 +1,554 @@
+/**
+ * @NApiVersion 2.1
+ * @NScriptType Suitelet
+ * @NModuleScope SameAccount
+ *
+ * GYH_BuildableOrders_SL
+ * ----------------------------------------------------------------------------
+ * Shows open, unshipped sales orders at the GEN-Y HITCH location and answers:
+ *   "Can we build this right now, and if not, why not?"
+ *
+ * Design decisions (confirmed with Lamar, Aug 2026):
+ *   - Location scope ....... location ID 1 (GEN-Y HITCH) ONLY. Child locations
+ *                           (Powdercoat, Amazon DC, OFFSITE vendors) excluded.
+ *   - Past due ............. trandate + category lead days < today
+ *   - Buildability ......... order-level rollup with line-level drill-down
+ *   - Competing demand ..... netted. Supply is allocated across orders in due
+ *                           date order (earliest first), so the same 42 units
+ *                           cannot be promised to three different orders.
+ *   - NULL max_buildable ... treated as ZERO / not buildable
+ *   - Stock first .......... on-hand available is consumed before build capacity
+ *   - WO signal ............ open WOs filtered to custbody_gyh_traveler_printed='T'
+ *                           (the job traveler stamp field). Reports presence and
+ *                           quantity, NOT a promised date -- see note below.
+ *
+ * KNOWN DATA CAVEATS (surfaced during build, verified against prod):
+ *   1. inventoryitemlocations.quantityavailable is stale account-wide and returns
+ *      0 for every item. inventorybalance is the live table. Do not "optimize"
+ *      this back to inventoryitemlocations.
+ *   2. 7,049 of 12,802 active assemblies have a NULL custitem_gny_max_buildable.
+ *      Per decision these count as zero, so the on-hand check carries most of the
+ *      weight. If that job ever gets fixed, this report gets much sharper.
+ *   3. 92% of open work orders have an enddate in the past (avg 18 days over for
+ *      printed WOs). The WO column therefore does NOT promise a completion date.
+ *      Showing enddate as an ETA would be actively misleading.
+ */
+
+define(['N/query', 'N/ui/serverWidget', 'N/runtime'], function (query, serverWidget, runtime) {
+
+    // ---------------------------------------------------------------- config
+
+    var HITCH_LOCATION = 1;
+    var ACCOUNT_ID     = '5262266';
+
+    // Lead time in days by customer category ID. Source: Lamar, Aug 2026.
+    // Key 0 = customer record has no category set.
+    var LEAD_DAYS = {
+        0: 10,   // (no category set)
+        1: 10,   // National Distribution
+        2: 10,   // E-Commerce Wholesale
+        4: 10,   // Master Dealer
+        5: 5,    // Inside Sales
+        6: 5,    // GEN-Y US Web Orders
+        7: 5,    // GEN-Y CDN Web Orders
+        8: 5,    // Amazon US
+        9: 5,    // AMAZON-CAN
+        10: 5,   // Ebay-US
+        11: 10,  // Standard Dealer
+        13: 10,  // Regional Distribution
+        14: 5,   // Jobber/Fleet
+        15: 15,  // Manufacturer/OEM
+        16: 15,  // Sponsor Account
+        17: 10,  // Canada
+        18: 5,   // Not Specified
+        21: 0,   // GEN-Y WEB-US -IA
+        22: 10,  // Inter Company
+        23: 10,  // Chile
+        24: 10,  // United Kingdom
+        25: 10,  // Box Store
+        26: 5,   // Walmart
+        29: 30,  // International Distributor
+        30: 5,   // TikTok
+        31: 10   // Canada Distributor
+    };
+    var DEFAULT_LEAD_DAYS = 10;
+
+    var STATUS = {
+        SHIP:    { key: 'SHIP',    label: 'Ship now',      rank: 0, css: 'st-ship'  },
+        BUILD:   { key: 'BUILD',   label: 'Build now',     rank: 1, css: 'st-build' },
+        PARTIAL: { key: 'PARTIAL', label: 'Partial',       rank: 2, css: 'st-part'  },
+        WO:      { key: 'WO',      label: 'On a WO',       rank: 3, css: 'st-wo'    },
+        BLOCKED: { key: 'BLOCKED', label: 'Blocked',       rank: 4, css: 'st-block' }
+    };
+
+    // ----------------------------------------------------------------- utils
+
+    function esc(v) {
+        if (v === null || v === undefined) return '';
+        return String(v)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+
+    function parseNsDate(s) {
+        // NetSuite SuiteQL returns MM/DD/YYYY
+        if (!s) return null;
+        var p = String(s).split('/');
+        if (p.length !== 3) return null;
+        return new Date(parseInt(p[2], 10), parseInt(p[0], 10) - 1, parseInt(p[1], 10));
+    }
+
+    function addDays(d, n) {
+        var r = new Date(d.getTime());
+        r.setDate(r.getDate() + n);
+        return r;
+    }
+
+    function fmtDate(d) {
+        if (!d) return '';
+        return (d.getMonth() + 1) + '/' + d.getDate() + '/' + d.getFullYear();
+    }
+
+    function daysBetween(a, b) {
+        return Math.round((b.getTime() - a.getTime()) / 86400000);
+    }
+
+    function soUrl(id) {
+        return 'https://' + ACCOUNT_ID + '.app.netsuite.com/app/accounting/transactions/salesord.nl?id=' + id;
+    }
+
+    function woUrl(id) {
+        return 'https://' + ACCOUNT_ID + '.app.netsuite.com/app/accounting/transactions/workord.nl?id=' + id;
+    }
+
+    function itemUrl(id) {
+        return 'https://' + ACCOUNT_ID + '.app.netsuite.com/app/common/item/item.nl?id=' + id;
+    }
+
+    // ------------------------------------------------------------- data pull
+
+    /**
+     * Open, unshipped SO lines at the hitch location.
+     * One row per SO line. Header data repeats -- grouped in JS.
+     */
+    function fetchOpenLines() {
+        var sql =
+            "SELECT " +
+            "  t.id                AS so_id, " +
+            "  t.tranid            AS so_num, " +
+            "  t.trandate          AS tran_date, " +
+            "  t.status            AS so_status, " +
+            "  t.custbody_ordernotes AS order_notes, " +
+            "  c.id                AS cust_id, " +
+            "  c.entityid          AS cust_num, " +
+            "  c.companyname       AS cust_name, " +
+            "  NVL(c.category, 0)  AS cat_id, " +
+            "  tl.id               AS line_id, " +
+            "  tl.linesequencenumber AS line_seq, " +
+            "  tl.memo             AS line_memo, " +
+            "  i.id                AS item_id, " +
+            "  i.itemid            AS item_name, " +
+            "  i.itemtype          AS item_type, " +
+            "  ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) AS qty_open, " +
+            "  NVL(i.custitem_gny_max_buildable, 0) AS max_build, " +
+            "  NVL(ib.avail, 0)    AS qty_avail, " +
+            "  NVL(ib.onhand, 0)   AS qty_onhand " +
+            "FROM transaction t " +
+            "JOIN customer c ON c.id = t.entity " +
+            "JOIN transactionline tl ON tl.transaction = t.id " +
+            "JOIN item i ON i.id = tl.item " +
+            "LEFT JOIN ( " +
+            "   SELECT item, SUM(quantityonhand) AS onhand, SUM(quantityavailable) AS avail " +
+            "   FROM inventorybalance WHERE location = " + HITCH_LOCATION + " GROUP BY item " +
+            ") ib ON ib.item = tl.item " +
+            "WHERE t.type = 'SalesOrd' " +
+            "  AND t.status IN ('A','B','D','E') " +
+            "  AND tl.mainline = 'F' " +
+            "  AND tl.location = " + HITCH_LOCATION + " " +
+            "  AND tl.isclosed = 'F' " +
+            "  AND tl.itemtype IN ('Assembly','InvtPart','Kit') " +
+            "  AND ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) > 0 " +
+            "ORDER BY t.trandate, t.tranid, tl.linesequencenumber";
+
+        return query.runSuiteQL({ query: sql }).asMappedResults();
+    }
+
+    /**
+     * Open work orders with a PRINTED job traveler, aggregated per item.
+     * Unprinted and null-printed WOs are excluded: the 538 null-printed WOs
+     * average 191 days open and are effectively abandoned.
+     */
+    function fetchPrintedWos() {
+        var sql =
+            "SELECT " +
+            "  wl.item             AS item_id, " +
+            "  COUNT(*)            AS wo_count, " +
+            "  SUM(ABS(NVL(wl.quantity,0))) AS wo_qty, " +
+            "  MIN(w.enddate)      AS earliest_end, " +
+            "  MAX(w.enddate)      AS latest_end " +
+            "FROM transaction w " +
+            "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
+            "WHERE w.type = 'WorkOrd' " +
+            "  AND w.status IN ('A','B','D') " +
+            "  AND w.custbody_gyh_traveler_printed = 'T' " +
+            "GROUP BY wl.item";
+
+        var map = {};
+        query.runSuiteQL({ query: sql }).asMappedResults().forEach(function (r) {
+            map[r.item_id] = {
+                count: num(r.wo_count),
+                qty: num(r.wo_qty),
+                earliest: r.earliest_end,
+                latest: r.latest_end
+            };
+        });
+        return map;
+    }
+
+    // --------------------------------------------------------- core analysis
+
+    /**
+     * Groups lines into orders, computes due dates, then allocates scarce supply
+     * across orders in due-date order.
+     *
+     * The allocation pass is the whole point of this tool. max_buildable is a
+     * per-item cached number that has no idea other orders exist, so three orders
+     * for 100 units each will all show "buildable" against a pool of 42. Here the
+     * pool is drawn down as it is consumed.
+     */
+    function buildModel(rows, woMap) {
+        var today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        var orders = {};
+        var lines = [];
+
+        rows.forEach(function (r) {
+            var soId = String(r.so_id);
+
+            if (!orders[soId]) {
+                var td = parseNsDate(r.tran_date);
+                var lead = LEAD_DAYS.hasOwnProperty(r.cat_id)
+                    ? LEAD_DAYS[r.cat_id]
+                    : DEFAULT_LEAD_DAYS;
+                var due = td ? addDays(td, lead) : null;
+
+                orders[soId] = {
+                    id: r.so_id,
+                    num: r.so_num,
+                    tranDate: td,
+                    dueDate: due,
+                    leadDays: lead,
+                    catId: r.cat_id,
+                    daysLate: due ? daysBetween(due, today) : 0,
+                    custNum: r.cust_num,
+                    custName: r.cust_name || ('Customer ' + r.cust_num),
+                    notes: r.order_notes || '',
+                    soStatus: r.so_status,
+                    lines: []
+                };
+            }
+
+            var line = {
+                soId: soId,
+                lineId: r.line_id,
+                seq: r.line_seq,
+                itemId: r.item_id,
+                itemName: r.item_name,
+                memo: r.line_memo || '',
+                qtyOpen: num(r.qty_open),
+                maxBuild: num(r.max_build),
+                qtyAvail: num(r.qty_avail),
+                qtyOnHand: num(r.qty_onhand),
+                fromStock: 0,
+                fromBuild: 0,
+                shortfall: 0,
+                status: STATUS.BLOCKED,
+                wo: woMap[r.item_id] || null
+            };
+
+            orders[soId].lines.push(line);
+            lines.push(line);
+        });
+
+        // Sort lines by their order's due date so the most urgent order draws
+        // from the shared pool first. Undated orders fall to the back.
+        lines.sort(function (a, b) {
+            var da = orders[a.soId].dueDate;
+            var db = orders[b.soId].dueDate;
+            if (!da && !db) return 0;
+            if (!da) return 1;
+            if (!db) return -1;
+            return da.getTime() - db.getTime();
+        });
+
+        // Per-item supply pools, consumed as we walk the sorted lines.
+        var stockPool = {};
+        var buildPool = {};
+
+        lines.forEach(function (ln) {
+            if (!stockPool.hasOwnProperty(ln.itemId)) stockPool[ln.itemId] = ln.qtyAvail;
+            if (!buildPool.hasOwnProperty(ln.itemId)) buildPool[ln.itemId] = ln.maxBuild;
+
+            var need = ln.qtyOpen;
+
+            // Stock first -- a finished unit on the shelf beats build capacity.
+            var takeStock = Math.min(need, stockPool[ln.itemId]);
+            stockPool[ln.itemId] -= takeStock;
+            ln.fromStock = takeStock;
+            need -= takeStock;
+
+            // Then build capacity, netted against everything already promised.
+            var takeBuild = Math.min(need, buildPool[ln.itemId]);
+            buildPool[ln.itemId] -= takeBuild;
+            ln.fromBuild = takeBuild;
+            need -= takeBuild;
+
+            ln.shortfall = need;
+
+            if (need <= 0) {
+                ln.status = (ln.fromBuild > 0) ? STATUS.BUILD : STATUS.SHIP;
+            } else if (ln.fromStock > 0 || ln.fromBuild > 0) {
+                ln.status = STATUS.PARTIAL;
+            } else if (ln.wo && ln.wo.qty > 0) {
+                ln.status = STATUS.WO;
+            } else {
+                ln.status = STATUS.BLOCKED;
+            }
+        });
+
+        // Order rollup = worst line on the order.
+        var list = [];
+        Object.keys(orders).forEach(function (k) {
+            var o = orders[k];
+            var worst = STATUS.SHIP;
+            var blocked = 0;
+            o.lines.forEach(function (ln) {
+                if (ln.status.rank > worst.rank) worst = ln.status;
+                if (ln.status.rank >= STATUS.PARTIAL.rank) blocked++;
+            });
+            o.status = worst;
+            o.blockedLines = blocked;
+            list.push(o);
+        });
+
+        // Most urgent first.
+        list.sort(function (a, b) {
+            if (b.daysLate !== a.daysLate) return b.daysLate - a.daysLate;
+            return String(a.num).localeCompare(String(b.num));
+        });
+
+        return list;
+    }
+
+    // ------------------------------------------------------------- rendering
+
+    function renderStyles() {
+        return '<style>' +
+            'body{font-family:Arial,Helvetica,sans-serif;font-size:12px;margin:0;padding:16px;background:#f7f7f9;color:#222}' +
+            'h1{font-size:18px;margin:0 0 2px 0}' +
+            '.sub{color:#666;font-size:11px;margin-bottom:14px}' +
+            '.cards{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}' +
+            '.card{background:#fff;border:1px solid #ddd;border-radius:5px;padding:9px 14px;min-width:104px}' +
+            '.card .n{font-size:21px;font-weight:bold;line-height:1.1}' +
+            '.card .l{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.4px}' +
+            '.bar{background:#fff;border:1px solid #ddd;border-radius:5px;padding:9px 12px;margin-bottom:12px}' +
+            '.bar label{margin-right:6px;font-weight:bold}' +
+            '.bar select,.bar input{padding:4px;margin-right:14px;border:1px solid #ccc;border-radius:3px;font-size:12px}' +
+            'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #ddd;border-radius:5px;overflow:hidden}' +
+            'th{background:#1f3864;color:#fff;text-align:left;padding:7px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.3px}' +
+            'td{padding:7px 9px;border-top:1px solid #eee;vertical-align:top}' +
+            'tr.ord{cursor:pointer}' +
+            'tr.ord:hover{background:#f0f4fb}' +
+            'tr.det{background:#fafbfd;display:none}' +
+            'tr.det.open{display:table-row}' +
+            '.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;white-space:nowrap}' +
+            '.st-ship{background:#d5f0dd;color:#12632f}' +
+            '.st-build{background:#d9e8fb;color:#12457f}' +
+            '.st-part{background:#fdeecd;color:#8a5a00}' +
+            '.st-wo{background:#e7e0f7;color:#4b2e83}' +
+            '.st-block{background:#fbdada;color:#9a1c1c}' +
+            '.late{color:#c00;font-weight:bold}' +
+            '.ontime{color:#666}' +
+            '.notes{background:#fffbe6;border-left:3px solid #e8c14a;padding:6px 9px;margin:5px 0;font-size:11px;white-space:pre-wrap}' +
+            '.inner{width:100%;border:none;background:transparent}' +
+            '.inner th{background:#e9ecf3;color:#333;font-size:10px}' +
+            '.inner td{border-top:1px solid #eee;font-size:11px}' +
+            'a{color:#1f3864}' +
+            '.mono{font-family:Consolas,Monaco,monospace}' +
+            '.warn{background:#fff4f4;border:1px solid #f0c4c4;border-radius:5px;padding:8px 12px;margin-bottom:12px;font-size:11px;color:#7a2020}' +
+            '.caret{display:inline-block;width:10px;color:#888}' +
+            '</style>';
+    }
+
+    function renderScript() {
+        return '<script>' +
+            'function tgl(id){' +
+            ' var r=document.getElementById("d"+id);' +
+            ' var c=document.getElementById("c"+id);' +
+            ' if(!r)return;' +
+            ' r.classList.toggle("open");' +
+            ' if(c)c.innerHTML=r.classList.contains("open")?"\\u25BC":"\\u25B6";' +
+            '}' +
+            'function flt(){' +
+            ' var s=document.getElementById("fSt").value;' +
+            ' var q=document.getElementById("fQ").value.toLowerCase();' +
+            ' var late=document.getElementById("fLate").checked;' +
+            ' var rows=document.querySelectorAll("tr.ord");' +
+            ' var shown=0;' +
+            ' for(var i=0;i<rows.length;i++){' +
+            '  var r=rows[i];' +
+            '  var ok=true;' +
+            '  if(s&&r.getAttribute("data-st")!==s)ok=false;' +
+            '  if(late&&r.getAttribute("data-late")!=="1")ok=false;' +
+            '  if(q&&r.getAttribute("data-search").indexOf(q)<0)ok=false;' +
+            '  r.style.display=ok?"":"none";' +
+            '  var d=document.getElementById("d"+r.getAttribute("data-id"));' +
+            '  if(d&&!ok)d.classList.remove("open");' +
+            '  if(ok)shown++;' +
+            ' }' +
+            ' document.getElementById("cnt").textContent=shown;' +
+            '}' +
+            '</script>';
+    }
+
+    function renderLineTable(o) {
+        var h = '<table class="inner"><tr>' +
+            '<th>Item</th><th>Need</th><th>From stock</th><th>Build</th>' +
+            '<th>Short</th><th>On hand</th><th>Max build</th><th>Printed WOs</th><th>Status</th>' +
+            '</tr>';
+
+        o.lines.forEach(function (ln) {
+            var woTxt = '&mdash;';
+            if (ln.wo && ln.wo.qty > 0) {
+                woTxt = ln.wo.count + ' WO' + (ln.wo.count > 1 ? 's' : '') +
+                        ' &middot; ' + ln.wo.qty + ' pcs';
+            }
+            h += '<tr>' +
+                '<td><a href="' + itemUrl(ln.itemId) + '" target="_blank" class="mono">' + esc(ln.itemName) + '</a></td>' +
+                '<td>' + ln.qtyOpen + '</td>' +
+                '<td>' + (ln.fromStock || '&mdash;') + '</td>' +
+                '<td>' + (ln.fromBuild || '&mdash;') + '</td>' +
+                '<td>' + (ln.shortfall ? '<span class="late">' + ln.shortfall + '</span>' : '&mdash;') + '</td>' +
+                '<td>' + ln.qtyAvail + '</td>' +
+                '<td>' + ln.maxBuild + '</td>' +
+                '<td>' + woTxt + '</td>' +
+                '<td><span class="pill ' + ln.status.css + '">' + ln.status.label + '</span></td>' +
+                '</tr>';
+
+            if (ln.memo) {
+                h += '<tr><td colspan="9" style="color:#777;font-size:10px;padding-top:0">' +
+                     esc(ln.memo) + '</td></tr>';
+            }
+        });
+
+        return h + '</table>';
+    }
+
+    function renderPage(orders) {
+        var counts = { SHIP: 0, BUILD: 0, PARTIAL: 0, WO: 0, BLOCKED: 0 };
+        var lateCt = 0;
+        orders.forEach(function (o) {
+            counts[o.status.key]++;
+            if (o.daysLate > 0) lateCt++;
+        });
+
+        var h = '<html><head><title>Buildable Orders</title>' + renderStyles() + '</head><body>';
+
+        h += '<h1>Unshipped Orders &mdash; Can We Build It?</h1>';
+        h += '<div class="sub">GEN-Y HITCH location only &middot; open SOs (status A/B/D/E) &middot; ' +
+             'supply netted across orders by due date &middot; generated ' + fmtDate(new Date()) + '</div>';
+
+        h += '<div class="warn"><b>Reading the WO column:</b> open work orders are filtered to those with a ' +
+             'printed job traveler. It reports how much is on the floor, not a completion date &mdash; ' +
+             '92% of open WO end dates are already in the past, so those dates are not a reliable ETA.</div>';
+
+        h += '<div class="cards">' +
+            '<div class="card"><div class="n">' + orders.length + '</div><div class="l">Orders</div></div>' +
+            '<div class="card"><div class="n" style="color:#c00">' + lateCt + '</div><div class="l">Past due</div></div>' +
+            '<div class="card"><div class="n" style="color:#12632f">' + counts.SHIP + '</div><div class="l">Ship now</div></div>' +
+            '<div class="card"><div class="n" style="color:#12457f">' + counts.BUILD + '</div><div class="l">Build now</div></div>' +
+            '<div class="card"><div class="n" style="color:#8a5a00">' + counts.PARTIAL + '</div><div class="l">Partial</div></div>' +
+            '<div class="card"><div class="n" style="color:#4b2e83">' + counts.WO + '</div><div class="l">On a WO</div></div>' +
+            '<div class="card"><div class="n" style="color:#9a1c1c">' + counts.BLOCKED + '</div><div class="l">Blocked</div></div>' +
+            '</div>';
+
+        h += '<div class="bar">' +
+            '<label>Status</label><select id="fSt" onchange="flt()">' +
+            '<option value="">All</option>' +
+            '<option value="SHIP">Ship now</option>' +
+            '<option value="BUILD">Build now</option>' +
+            '<option value="PARTIAL">Partial</option>' +
+            '<option value="WO">On a WO</option>' +
+            '<option value="BLOCKED">Blocked</option>' +
+            '</select>' +
+            '<label>Search</label><input id="fQ" type="text" placeholder="SO#, customer, item" onkeyup="flt()" size="26">' +
+            '<label><input id="fLate" type="checkbox" onchange="flt()"> Past due only</label>' +
+            '<span style="float:right;color:#666">Showing <b id="cnt">' + orders.length + '</b></span>' +
+            '</div>';
+
+        h += '<table><tr>' +
+            '<th style="width:16px"></th><th>Order</th><th>Customer</th><th>Ordered</th>' +
+            '<th>Due</th><th>Days late</th><th>Lines</th><th>Status</th>' +
+            '</tr>';
+
+        orders.forEach(function (o) {
+            var search = (String(o.num) + ' ' + o.custName + ' ' + o.custNum + ' ' +
+                          o.lines.map(function (l) { return l.itemName; }).join(' ')).toLowerCase();
+
+            var lateCell = o.daysLate > 0
+                ? '<span class="late">' + o.daysLate + '</span>'
+                : '<span class="ontime">' + o.daysLate + '</span>';
+
+            h += '<tr class="ord" data-id="' + o.id + '" data-st="' + o.status.key + '" ' +
+                 'data-late="' + (o.daysLate > 0 ? '1' : '0') + '" ' +
+                 'data-search="' + esc(search) + '" onclick="tgl(' + o.id + ')">' +
+                '<td><span class="caret" id="c' + o.id + '">&#9654;</span></td>' +
+                '<td><a href="' + soUrl(o.id) + '" target="_blank" onclick="event.stopPropagation()">' +
+                    esc(o.num) + '</a></td>' +
+                '<td>' + esc(o.custName) + '<div style="color:#999;font-size:10px">' + esc(o.custNum) + '</div></td>' +
+                '<td>' + fmtDate(o.tranDate) + '</td>' +
+                '<td>' + fmtDate(o.dueDate) + '<div style="color:#999;font-size:10px">+' + o.leadDays + 'd</div></td>' +
+                '<td>' + lateCell + '</td>' +
+                '<td>' + o.lines.length + (o.blockedLines ? ' <span style="color:#c00">(' + o.blockedLines + ')</span>' : '') + '</td>' +
+                '<td><span class="pill ' + o.status.css + '">' + o.status.label + '</span></td>' +
+                '</tr>';
+
+            h += '<tr class="det" id="d' + o.id + '"><td></td><td colspan="7">';
+            if (o.notes) {
+                h += '<div class="notes"><b>Sales team notes:</b><br>' + esc(o.notes) + '</div>';
+            }
+            h += renderLineTable(o);
+            h += '</td></tr>';
+        });
+
+        h += '</table>' + renderScript() + '</body></html>';
+        return h;
+    }
+
+    // -------------------------------------------------------------- entry pt
+
+    function onRequest(context) {
+        if (context.request.method !== 'GET') return;
+
+        try {
+            var rows = fetchOpenLines();
+            var woMap = fetchPrintedWos();
+            var orders = buildModel(rows, woMap);
+            context.response.write(renderPage(orders));
+        } catch (e) {
+            log.error({ title: 'GYH_BuildableOrders_SL failed', details: e });
+            context.response.write(
+                '<html><body style="font-family:Arial;padding:24px">' +
+                '<h2 style="color:#9a1c1c">Report failed to run</h2>' +
+                '<p>' + esc(e.message || e) + '</p>' +
+                '<pre style="background:#f4f4f4;padding:12px;font-size:11px">' + esc(e.stack || '') + '</pre>' +
+                '</body></html>'
+            );
+        }
+    }
+
+    return { onRequest: onRequest };
+});
