@@ -243,7 +243,11 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             "  t.custbody_ordernotes AS order_notes, " +
             "  c.id                AS cust_id, " +
             "  c.entityid          AS cust_num, " +
-            "  c.companyname       AS cust_name, " +
+            // companyname is NULL on person-type customers (their name lives in
+            // altname), so fall through to it. Parent is pulled separately so a
+            // subcustomer shows which account it belongs to.
+            "  NVL(c.companyname, c.altname) AS cust_name, " +
+            "  NVL(p.companyname, p.altname) AS parent_name, " +
             "  NVL(c.category, 0)  AS cat_id, " +
             "  tl.uniquekey        AS line_id, " +   // tl.id is the per-order line index, NOT unique
             "  tl.linesequencenumber AS line_seq, " +
@@ -258,6 +262,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             "  tlm.expectedshipdate AS exp_ship " +
             "FROM transaction t " +
             "JOIN customer c ON c.id = t.entity " +
+            "LEFT JOIN customer p ON p.id = c.parent " +
             "JOIN transactionline tl ON tl.transaction = t.id " +
             "JOIN item i ON i.id = tl.item " +
             "LEFT JOIN ( " +
@@ -496,7 +501,8 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                     tab: tabKey,
                     daysLate: due ? daysBetween(due, today) : 0,
                     custNum: r.cust_num,
-                    custName: r.cust_name || ('Customer ' + r.cust_num),
+                    custName: r.cust_name || r.cust_num,
+                    parentName: r.parent_name || '',
                     notes: r.order_notes || '',
                     soStatus: r.so_status,
                     lines: []
@@ -1051,7 +1057,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             '</tr>';
 
         orders.forEach(function (o) {
-            var search = (String(o.num) + ' ' + o.custName + ' ' + o.custNum + ' ' + o.notes + ' ' +
+            var search = (String(o.num) + ' ' + o.custName + ' ' + o.parentName + ' ' + o.custNum + ' ' + o.notes + ' ' +
                           o.lines.map(function (l) { return l.itemName; }).join(' ')).toLowerCase();
 
             // Severity band for days late: 0 / 1-7 / 8-30 / 30+. Encodes how bad,
@@ -1067,7 +1073,10 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 '<td class="edge"><span class="edgebar"></span></td>' +
                 '<td><span class="caret" data-for="' + o.id + '">&#9654;</span></td>' +
                 '<td><a class="so" href="' + soUrl(o.id) + '" target="_blank">' + esc(o.num) + '</a></td>' +
-                '<td><div class="cust">' + esc(o.custName) + '</div><div class="muted">' + esc(o.custNum) + '</div></td>' +
+                '<td><div class="cust">' + esc(o.custName) + '</div>' +
+                    '<div class="muted">' +
+                    (o.parentName ? esc(o.parentName) + ' &middot; ' : '') +
+                    esc(o.custNum) + '</div></td>' +
                 '<td class="num">' + fmtDate(o.tranDate) + '</td>' +
                 '<td class="num">' + fmtDate(o.dueDate) +
                     (o.dueSource === 'actual'
