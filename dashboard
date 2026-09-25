@@ -45,11 +45,18 @@
  *      Showing enddate as an ETA would be actively misleading.
  */
 
-define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, serverWidget, log, runtime) {
+define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime', 'N/record', 'N/url', 'N/cache'],
+function (query, serverWidget, log, runtime, record, url, cache) {
 
     // ---------------------------------------------------------------- config
 
-    var HITCH_LOCATION = 1;
+    var HITCH_LOCATION = 1;    // GEN-Y HITCH
+    var DOOR_LOCATION  = 48;   // GEN-Y DOOR
+
+    // Both plants are in scope. No open order currently has lines at both, so an
+    // order belongs cleanly to one site; the tab mapping relies on that.
+    var SCOPE_LOCATIONS = [HITCH_LOCATION, DOOR_LOCATION];
+    var SCOPE_SQL = SCOPE_LOCATIONS.join(',');
     var ACCOUNT_ID     = '5262266';
     var WRAP           = 'gyh-bo';   // single wrapper id -- everything scopes to this
 
@@ -105,9 +112,84 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         return '(' + col + ' IN (' + vals.join(',') + '))';
     }
 
+    /**
+     * StickyNotes (the bundle, not NetSuite's built-in User Notes) stores notes in
+     * CUSTOMRECORD_STICK_NOTE, linked by record-type string + record id rather
+     * than a real foreign key. The built-in `note` record is NOT used for these:
+     * it holds 28 sales-order rows account-wide, newest from 2023, and its text
+     * fields are not exposed to SuiteQL at all.
+     *
+     * A note with is_public='F' is restricted to custrecord_sn_allowed_entities.
+     * This Suitelet runs as Administrator so it CAN read them; set this to false
+     * to show only public notes.
+     */
+    var SHOW_PRIVATE_STICKIES = true;
+
+    var STICKY_PRIORITY = { 1: 'High', 2: 'Normal', 3: 'Low' };
+
+    /**
+     * Values the StickyNotes bundle expects on a note it will render. Taken from
+     * the 418 existing sales-order notes, which are uniform on all of these.
+     *
+     * -102 is the bundle's internal code for the sales order record type.
+     * percent_top / percent_left place the note on the record page; existing
+     * notes cluster in the top-right, so a new one lands there too and the user
+     * can drag it afterwards.
+     */
+    var STICKY_NEW = {
+        scriptedRecordType: -102,
+        recordTypeScriptId: 'salesorder',
+        zIndex: 101,
+        status: 'new',
+        percentTop: 20,
+        percentLeft: 84
+    };
+
     var SO_OPEN = ['A', 'B', 'D', 'E'];   // Pending Approval, Pending Fulfillment,
                                           // Partially Fulfilled, Pending Billing/Part Fulfilled
     var WO_OPEN = ['A', 'B', 'D'];        // Planned, Released, In Process
+    var WO_STATUS = { A: 'Planned', B: 'Released', D: 'In process' };
+
+    /**
+     * "On the floor" = traveler printed AND released to production.
+     * Planned (A) is excluded: it is scheduled, not running.
+     *
+     * Measured in this account: 838 open WOs meet this bar and every one of
+     * them is a COMPONENT work order. No GH- finished-goods WO is ever
+     * traveler-printed, so the floor signal for a sellable item comes from its
+     * components, not from its own work order.
+     */
+    var WO_FLOOR = ['B', 'D'];
+
+    /**
+     * How far back to look for an item's most recent work order when deriving
+     * its component list.
+     *
+     * Without this bound the MAX(w2.id) GROUP BY scans every work order line in
+     * the account and the query does not return at all. A part built in the
+     * last year has a current BOM; one that has not been built in a year is not
+     * going to be on the floor today either.
+     */
+    var WO_LOOKBACK_MONTHS = 12;
+
+    /**
+     * BOM component lists are CACHED across page loads.
+     *
+     * Deriving an item's components (via its latest work order) is the single
+     * most expensive query this Suitelet runs, and the answer barely changes:
+     * components are built to stock, and a GH- part's BOM is the same today as
+     * it was this morning. Caching it means only the first load after the cache
+     * expires pays for it; every later load reads the list back in one call.
+     *
+     * The floor-WO counts are NOT cached -- those change as Maynard prints
+     * travelers and jobs complete, and the aggregate is cheap anyway.
+     */
+    var BOM_CACHE_NAME = 'gyh_bo_bom';
+    var BOM_CACHE_TTL  = 6 * 60 * 60;   // seconds; 6 hours
+    function floorWoPredicate(alias) {
+        return statusIn(alias + '.status', 'WorkOrd', WO_FLOOR) +
+               " AND " + alias + ".custbody_gyh_traveler_printed = 'T'";
+    }
 
     /**
      * Customer type tabs. Maps customer category ID -> tab key.
@@ -151,10 +233,17 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
     // Order matters -- this is left-to-right tab order.
     // UNASSIGNED renders only when it actually has orders, so in normal operation
     // this is a three-tab report as specified.
+    /**
+     * Tabs. RETAIL / OEM / WHOLESALE / UNASSIGNED are exclusive -- an order sits
+     * in exactly one. CUSTOM is an OVERLAY: it pulls any order with "custom" in a
+     * line description regardless of which exclusive tab it belongs to, so its
+     * count deliberately overlaps the others.
+     */
     var TABS = [
         { key: 'RETAIL',     label: 'Retail' },
         { key: 'OEM',        label: 'OEM' },
         { key: 'WHOLESALE',  label: 'Wholesale' },
+        { key: 'CUSTOM',     label: 'Custom', overlay: true, onlyIfPopulated: true },
         { key: 'UNASSIGNED', label: 'Unassigned', onlyIfPopulated: true }
     ];
 
@@ -162,12 +251,31 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         return TAB_OF_CATEGORY[catId] || 'UNASSIGNED';
     }
 
+    /**
+     * Status vocabulary. `desc` is the hover tooltip on the pill -- kept to one
+     * sentence each, because a tooltip people actually read is a short one.
+     */
     var STATUS = {
-        SHIP:    { key: 'SHIP',    label: 'Ship now',  rank: 0, css: 'st-ship'  },
-        BUILD:   { key: 'BUILD',   label: 'Build now', rank: 1, css: 'st-build' },
-        PARTIAL: { key: 'PARTIAL', label: 'Partial',   rank: 2, css: 'st-part'  },
-        WO:      { key: 'WO',      label: 'On a WO',   rank: 3, css: 'st-wo'    },
-        BLOCKED: { key: 'BLOCKED', label: 'Blocked',   rank: 4, css: 'st-block' }
+        SHIP: {
+            key: 'SHIP', label: 'Ship now', rank: 0, css: 'st-ship',
+            desc: 'Finished stock is on the shelf at GEN-Y HITCH. Pick and ship today, no manufacturing needed.'
+        },
+        BUILD: {
+            key: 'BUILD', label: 'Build now', rank: 1, css: 'st-build',
+            desc: 'Not enough finished stock, but components are on hand and unclaimed. Release a work order and it can go.'
+        },
+        PARTIAL: {
+            key: 'PARTIAL', label: 'Partial', rank: 2, css: 'st-part',
+            desc: 'Part of the quantity is covered, part is not. Expand to see how much can ship and how many units are short.'
+        },
+        WIP: {
+            key: 'WIP', label: 'WIP', rank: 3, css: 'st-wip',
+            desc: 'On the floor now: an open work order with a printed traveler. In progress, not a promised date.'
+        },
+        BLOCKED: {
+            key: 'BLOCKED', label: 'Not started', rank: 4, css: 'st-block',
+            desc: 'No stock, no build capacity, no work order. Nothing is moving on this one yet.'
+        }
     };
 
     // ----------------------------------------------------------------- utils
@@ -215,6 +323,24 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         return (t.length <= max) ? t : t.substring(0, max - 1) + '\u2026';
     }
 
+    /**
+     * StickyNotes stores line breaks as the literal token [br]. Escape FIRST,
+     * then convert -- doing it the other way round would let a note body inject
+     * markup into the page.
+     */
+    function stickyHtml(msg) {
+        return esc(msg).replace(/\[br\]/gi, '<br>');
+    }
+
+    function stickyPlain(msg) {
+        return String(msg || '').replace(/\[br\]/gi, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function money(v) {
+        var n = Math.round(num(v));
+        return '$' + String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    }
+
     function soUrl(id) {
         return '/app/accounting/transactions/salesord.nl?id=' + id;
     }
@@ -259,23 +385,35 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             "  NVL(i.custitem_gny_max_buildable, 0) AS max_build, " +
             "  NVL(ib.avail, 0)    AS qty_avail, " +
             "  NVL(ib.onhand, 0)   AS qty_onhand, " +
-            "  tlm.expectedshipdate AS exp_ship " +
+            "  tlm.expectedshipdate AS exp_ship, " +
+            "  tl.location         AS loc_id, " +
+            "  t.total             AS order_total, " +
+            // Channel flag, not a category: Shopify orders sit under many
+            // customer categories, so this overrides the tab mapping.
+            "  CASE WHEN t.custbody_shopify_order_id IS NOT NULL THEN 1 ELSE 0 END AS is_shopify, " +
+            // "Custom" lives in the line description as typed onto the order.
+            "  CASE WHEN UPPER(tl.memo) LIKE '%CUSTOM%' " +
+            "         OR UPPER(i.displayname) LIKE '%CUSTOM%' THEN 1 ELSE 0 END AS is_custom " +
             "FROM transaction t " +
             "JOIN customer c ON c.id = t.entity " +
             "LEFT JOIN customer p ON p.id = c.parent " +
             "JOIN transactionline tl ON tl.transaction = t.id " +
             "JOIN item i ON i.id = tl.item " +
+            // On-hand must come from the line's OWN plant. Joining on item alone
+            // would let door stock satisfy a hitch line and vice versa.
             "LEFT JOIN ( " +
-            "   SELECT item, SUM(quantityonhand) AS onhand, SUM(quantityavailable) AS avail " +
-            "   FROM inventorybalance WHERE location = " + HITCH_LOCATION + " GROUP BY item " +
-            ") ib ON ib.item = tl.item " +
+            "   SELECT item, location, SUM(quantityonhand) AS onhand, " +
+            "          SUM(quantityavailable) AS avail " +
+            "   FROM inventorybalance WHERE location IN (" + SCOPE_SQL + ") " +
+            "   GROUP BY item, location " +
+            ") ib ON ib.item = tl.item AND ib.location = tl.location " +
             // Real ship date lives on the MAINLINE row. transaction.enddate is
             // null account-wide, so do not reach for it.
             "LEFT JOIN transactionline tlm ON tlm.transaction = t.id AND tlm.mainline = 'T' " +
             "WHERE t.type = 'SalesOrd' " +
             "  AND " + statusIn('t.status', 'SalesOrd', SO_OPEN) + " " +
             "  AND tl.mainline = 'F' " +
-            "  AND tl.location = " + HITCH_LOCATION + " " +
+            "  AND tl.location IN (" + SCOPE_SQL + ") " +
             "  AND tl.isclosed = 'F' " +
             "  AND tl.itemtype IN ('Assembly','InvtPart','Kit') " +
             "  AND ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) > 0 " +
@@ -284,36 +422,344 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         return query.runSuiteQL({ query: sql }).asMappedResults();
     }
 
+    // ---------------------------------------------------------- WIP lookups
+    //
+    // SPLIT BY COST, mirroring the shop-floor tablet's blocker panel:
+    //
+    //   CHEAP  (every page load)  -- two aggregate queries returning ONE ROW
+    //          PER ITEM: how many work orders are on the floor for the item
+    //          itself, and how many of its components are. That is everything
+    //          the status pill and the collapsed headline need.
+    //   COSTLY (on demand, one item) -- the actual work order rows, their
+    //          progress, and which component each belongs to. Fetched only when
+    //          someone opens a line.
+    //
+    // The previous version pulled every open work order in the account with up
+    // to 8 full rows each, plus 1,613 BOM component links, on every single load
+    // -- to render panels that were collapsed and that nobody had asked for.
+
     /**
-     * Open work orders with a PRINTED job traveler, aggregated per item.
-     * Unprinted and null-printed WOs are excluded: the 538 null-printed WOs
-     * average 191 days open and are effectively abandoned.
+     * Per-item count of work orders ON THE FLOOR for that exact item.
+     * Counts only; no rows.
      */
-    function fetchPrintedWos() {
+    function fetchDirectWoCounts() {
         var sql =
-            "SELECT " +
-            "  wl.item             AS item_id, " +
-            "  COUNT(*)            AS wo_count, " +
-            "  SUM(ABS(NVL(wl.quantity,0))) AS wo_qty, " +
-            "  MIN(w.enddate)      AS earliest_end, " +
-            "  MAX(w.enddate)      AS latest_end " +
+            "SELECT wl.item AS item_id, " +
+            "  COUNT(*) AS wo_ct, " +
+            "  SUM(ABS(NVL(wl.quantity,0)) - ABS(NVL(wl.quantityshiprecv,0))) AS open_qty " +
             "FROM transaction w " +
             "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
-            "WHERE w.type = 'WorkOrd' " +
-            "  AND " + statusIn('w.status', 'WorkOrd', WO_OPEN) + " " +
-            "  AND w.custbody_gyh_traveler_printed = 'T' " +
+            "WHERE w.type = 'WorkOrd' AND " + floorWoPredicate('w') + " " +
             "GROUP BY wl.item";
 
         var map = {};
         query.runSuiteQL({ query: sql }).asMappedResults().forEach(function (r) {
-            map[r.item_id] = {
-                count: num(r.wo_count),
-                qty: num(r.wo_qty),
-                earliest: r.earliest_end,
-                latest: r.latest_end
-            };
+            map[String(r.item_id)] = { woCount: num(r.wo_ct), openQty: num(r.open_qty) };
         });
         return map;
+    }
+
+    /**
+     * Level-1 components for the given items, from a per-item cache. Only
+     * items missing from the cache hit the database, and those are queried in
+     * small date-bounded chunks and written back for next time.
+     *
+     * Returns { <itemId>: [componentItemId, ...] }.
+     */
+    function fetchBomLinksCached(itemIds) {
+        var links = {};
+        if (!itemIds || !itemIds.length) return links;
+
+        var store = null;
+        try {
+            store = cache.getCache({ name: BOM_CACHE_NAME, scope: cache.Scope.PROTECTED });
+        } catch (e) {
+            log.audit({ title: 'BOM cache unavailable, querying live', details: e.message || e });
+        }
+
+        var missing = [];
+        itemIds.forEach(function (id) {
+            var k = String(id);
+            var hit = null;
+            if (store) {
+                try { hit = store.get({ key: 'bom2:' + k }); } catch (e2) { hit = null; }
+            }
+            if (hit !== null && hit !== undefined) {
+                try { links[k] = JSON.parse(hit); } catch (e3) { missing.push(id); }
+            } else {
+                missing.push(id);
+            }
+        });
+
+        if (missing.length) {
+            var CHUNK = 60;
+            for (var i = 0; i < missing.length; i += CHUNK) {
+                var ids = missing.slice(i, i + CHUNK).join(',');
+                // per_unit = component qty on the WO / WO build qty. That is the
+                // BOM quantity per finished unit, which the short-component
+                // detail multiplies by the line's shortfall.
+                var sql =
+                    "SELECT wl.item AS parent_item, cl.item AS comp_item, " +
+                    "  CASE WHEN ABS(NVL(wl.quantity,0)) > 0 " +
+                    "       THEN ABS(NVL(cl.quantity,0)) / ABS(NVL(wl.quantity,0)) ELSE 0 END AS per_unit " +
+                    "FROM ( " +
+                    "   SELECT wl2.item AS built_item, MAX(w2.id) AS latest_wo " +
+                    "   FROM transaction w2 " +
+                    "   JOIN transactionline wl2 ON wl2.transaction = w2.id AND wl2.mainline = 'T' " +
+                    "   WHERE w2.type = 'WorkOrd' " +
+                    "     AND w2.trandate >= ADD_MONTHS(TRUNC(SYSDATE),-" + WO_LOOKBACK_MONTHS + ") " +
+                    "     AND wl2.item IN (" + ids + ") " +
+                    "   GROUP BY wl2.item " +
+                    ") latest " +
+                    "JOIN transactionline wl ON wl.transaction = latest.latest_wo AND wl.mainline = 'T' " +
+                    "JOIN transactionline cl ON cl.transaction = latest.latest_wo " +
+                    "     AND cl.mainline = 'F' AND cl.item IS NOT NULL AND cl.item <> wl.item";
+
+                var fresh = {};
+                query.runSuiteQL({ query: sql }).asMappedResults().forEach(function (r) {
+                    var k = String(r.parent_item);
+                    if (!fresh[k]) fresh[k] = [];
+                    var dup = false;
+                    for (var d = 0; d < fresh[k].length; d++) {
+                        if (fresh[k][d].id === r.comp_item) { fresh[k][d].perUnit += num(r.per_unit); dup = true; break; }
+                    }
+                    if (!dup) fresh[k].push({ id: r.comp_item, perUnit: num(r.per_unit) });
+                });
+
+                // Cache every item we asked about, including the ones with no
+                // BOM, so an item without one is not re-queried on every load.
+                missing.slice(i, i + CHUNK).forEach(function (id) {
+                    var k = String(id);
+                    var list = fresh[k] || [];
+                    links[k] = list;
+                    if (store) {
+                        try {
+                            store.put({ key: 'bom2:' + k, value: JSON.stringify(list), ttl: BOM_CACHE_TTL });
+                        } catch (e4) { /* cache write is best-effort */ }
+                    }
+                });
+            }
+        }
+
+        log.audit({
+            title: 'fetchBomLinksCached',
+            details: (itemIds.length - missing.length) + ' from cache, ' + missing.length + ' queried'
+        });
+        return links;
+    }
+
+    /**
+     * Floor work orders aggregated per COMPONENT item. One cheap query over
+     * the ~840 printed+released WOs; not cached, because this is the part that
+     * moves during the day.
+     */
+    function fetchFloorWoByItem() {
+        var sql =
+            "SELECT wl.item AS item_id, COUNT(*) AS wo_ct, " +
+            "  SUM(ABS(NVL(wl.quantity,0)) - ABS(NVL(wl.quantityshiprecv,0))) AS open_qty " +
+            "FROM transaction w " +
+            "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
+            "WHERE w.type = 'WorkOrd' AND " + floorWoPredicate('w') + " " +
+            "GROUP BY wl.item";
+        var map = {};
+        query.runSuiteQL({ query: sql }).asMappedResults().forEach(function (r) {
+            map[String(r.item_id)] = { woCount: num(r.wo_ct), openQty: num(r.open_qty) };
+        });
+        return map;
+    }
+
+    /**
+     * Per-item component-on-floor counts, assembled in JS from the cached BOM
+     * links and the live floor aggregate. No per-item database work at all
+     * once the cache is warm.
+     */
+    function fetchComponentFloorCounts(itemIds) {
+        var out = {};
+        if (!itemIds || !itemIds.length) return out;
+
+        var links = fetchBomLinksCached(itemIds);
+        var floor = fetchFloorWoByItem();
+
+        itemIds.forEach(function (id) {
+            var k = String(id);
+            var comps = 0, woCount = 0, openQty = 0;
+            (links[k] || []).forEach(function (c) {
+                var f = floor[String(c.id)];
+                if (f && f.woCount > 0) {
+                    comps++;
+                    woCount += f.woCount;
+                    openQty += f.openQty;
+                }
+            });
+            if (woCount > 0) out[k] = { comps: comps, woCount: woCount, openQty: openQty };
+        });
+        return out;
+    }
+
+    /**
+     * ON-DEMAND detail for ONE item: the work order rows behind the counts.
+     * Returns { direct: [...], components: [...], unprintedDirect: n }.
+     *
+     * unprintedDirect exists so nothing disappears silently: an item can have
+     * open work orders that simply have no traveler printed, and the panel says
+     * so rather than showing an empty section.
+     */
+    /**
+     * Where a work order physically is: its lowest still-open operation and
+     * that operation's work center. Pre-aggregated MIN() inline view JOINed in,
+     * never a correlated subquery. Returned as a SQL fragment to JOIN against
+     * an alias holding the WO id.
+     */
+    function currentOpJoin(woAlias) {
+        return "LEFT JOIN ( " +
+            "   SELECT m.workorder AS w, m.title AS opname, eg.groupname AS wcname, " +
+            "          NVL(m.completedquantity,0) AS opcomq, NVL(m.inputquantity,0) AS opinq " +
+            "   FROM manufacturingoperationtask m " +
+            "   LEFT JOIN entitygroup eg ON eg.id = m.manufacturingworkcenter " +
+            "   JOIN ( SELECT m2.workorder AS w2, MIN(m2.operationsequence) AS minseq " +
+            "          FROM manufacturingoperationtask m2 " +
+            "          WHERE NVL(m2.completedquantity,0) < NVL(m2.inputquantity,0) " +
+            "          GROUP BY m2.workorder ) mo " +
+            "     ON mo.w2 = m.workorder AND mo.minseq = m.operationsequence " +
+            ") op ON op.w = " + woAlias + ".id ";
+    }
+
+    // Work-center names are line-prefixed ("Hitch - Lathe"); the prefix is
+    // noise on a card that already says which plant you are looking at.
+    function shortWc(n) {
+        return String(n || '').replace(/^\s*(hitch|door)\s*[-\u2013]\s*/i, '').trim();
+    }
+
+    function fetchWipDetail(itemId, locId, shortQty) {
+        var id = Number(itemId);
+        var loc = Number(locId) || HITCH_LOCATION;
+        var shortUnits = Math.max(0, num(shortQty));
+        if (!id) return { direct: [], components: [], shorts: [], unprintedDirect: 0 };
+
+        var woCols =
+            "SELECT w.id, w.tranid, w.status, w.enddate, " +
+            "  ABS(NVL(wl.quantity,0))         AS qty, " +
+            "  ABS(NVL(wl.quantityshiprecv,0)) AS built, " +
+            "  NVL(w.custbody_gyh_traveler_printed,'F') AS printed, " +
+            "  op.opname, op.wcname, op.opcomq, op.opinq ";
+
+        function mapWo(r, compId, compName) {
+            return {
+                id: r.id,
+                tranid: r.tranid,
+                status: WO_STATUS[String(r.status).replace('WorkOrd:', '')] || r.status,
+                endDate: r.enddate,
+                qty: num(r.qty),
+                built: num(r.built),
+                printed: String(r.printed) === 'T',
+                comp: compId || null,
+                compName: compName || '',
+                // where it is on the floor
+                opName: r.opname || '',
+                wc: shortWc(r.wcname),
+                opDone: num(r.opcomq),
+                opQty: num(r.opinq)
+            };
+        }
+
+        // Work orders building this exact item, on the floor.
+        var direct = query.runSuiteQL({
+            query: woCols +
+                "FROM transaction w " +
+                "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
+                currentOpJoin('w') +
+                "WHERE w.type = 'WorkOrd' AND wl.item = " + id + " " +
+                "  AND " + floorWoPredicate('w') + " " +
+                "ORDER BY w.enddate"
+        }).asMappedResults().map(function (r) { return mapWo(r); });
+
+        // Open-but-not-printed work orders on this item, counted only.
+        var unprinted = 0;
+        try {
+            var u = query.runSuiteQL({
+                query: "SELECT COUNT(*) AS n FROM transaction w " +
+                       "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
+                       "WHERE w.type = 'WorkOrd' AND wl.item = " + id + " " +
+                       "  AND " + statusIn('w.status', 'WorkOrd', WO_OPEN) + " " +
+                       "  AND NVL(w.custbody_gyh_traveler_printed,'F') <> 'T'"
+            }).asMappedResults();
+            unprinted = u.length ? num(u[0].n) : 0;
+        } catch (e) { unprinted = 0; }
+
+        // Components of this item that are on the floor. The component list
+        // comes from the cache, so this is one indexed lookup over a short
+        // IN list rather than a re-derivation of the BOM.
+        var comps = [];
+        var compLinks = (fetchBomLinksCached([id])[String(id)] || []);
+        var compIds = compLinks.map(function (c) { return c.id; });
+        if (compIds.length) {
+            comps = query.runSuiteQL({
+                query:
+                    "SELECT wl.item AS comp_id, ci.itemid AS comp_name, " +
+                    "  w.id, w.tranid, w.status, w.enddate, " +
+                    "  ABS(NVL(wl.quantity,0))         AS qty, " +
+                    "  ABS(NVL(wl.quantityshiprecv,0)) AS built, " +
+                    "  NVL(w.custbody_gyh_traveler_printed,'F') AS printed, " +
+                    "  op.opname, op.wcname, op.opcomq, op.opinq " +
+                    "FROM transaction w " +
+                    "JOIN transactionline wl ON wl.transaction = w.id AND wl.mainline = 'T' " +
+                    "JOIN item ci ON ci.id = wl.item " +
+                    currentOpJoin('w') +
+                    "WHERE w.type = 'WorkOrd' AND " + floorWoPredicate('w') + " " +
+                    "  AND wl.item IN (" + compIds.map(Number).join(',') + ") " +
+                    "ORDER BY ci.itemid, w.enddate"
+            }).asMappedResults().map(function (r) { return mapWo(r, r.comp_id, r.comp_name); });
+        }
+
+        // ---- Which component is this line actually waiting on? ----------------
+        // need  = BOM per-unit qty x units short on this line
+        // have  = available at the line's plant
+        // Only components with need > have are the reason the line is short.
+        // Everything else has stock and is not the bottleneck, however many
+        // work orders happen to be running on it.
+        var shorts = [];
+        if (compLinks.length && shortUnits > 0) {
+            var onHand = {};
+            try {
+                query.runSuiteQL({
+                    query:
+                        "SELECT item, SUM(NVL(quantityavailable,0)) AS avail " +
+                        "FROM inventorybalance " +
+                        "WHERE location = " + loc + " AND item IN (" + compIds.map(Number).join(',') + ") " +
+                        "GROUP BY item"
+                }).asMappedResults().forEach(function (r) { onHand[String(r.item)] = num(r.avail); });
+            } catch (e) { /* treat as zero on hand */ }
+
+            var names = {};
+            comps.forEach(function (w) { if (w.comp) names[String(w.comp)] = w.compName; });
+            var missingNames = compIds.filter(function (c) { return !names[String(c)]; });
+            if (missingNames.length) {
+                try {
+                    query.runSuiteQL({
+                        query: "SELECT id, itemid FROM item WHERE id IN (" + missingNames.map(Number).join(',') + ")"
+                    }).asMappedResults().forEach(function (r) { names[String(r.id)] = r.itemid; });
+                } catch (e2) { /* fall back to ids */ }
+            }
+
+            compLinks.forEach(function (c) {
+                var need = c.perUnit * shortUnits;
+                var have = onHand[String(c.id)] || 0;
+                if (need > have + 0.0001) {
+                    shorts.push({
+                        id: c.id,
+                        name: names[String(c.id)] || ('item ' + c.id),
+                        perUnit: c.perUnit,
+                        need: Math.round(need * 1000) / 1000,
+                        have: Math.round(have * 1000) / 1000,
+                        short: Math.round((need - have) * 1000) / 1000,
+                        wos: comps.filter(function (w) { return String(w.comp) === String(c.id); })
+                    });
+                }
+            });
+            shorts.sort(function (a, b) { return b.short - a.short; });
+        }
+
+        return { direct: direct, components: comps, shorts: shorts, unprintedDirect: unprinted };
     }
 
     // ----------------------------------------------------------- diagnostics
@@ -352,17 +798,17 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
              "JOIN transactionline tl ON tl.transaction = t.id " +
              "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " AND tl.mainline = 'F'"],
 
-            ['5. + location = ' + HITCH_LOCATION,
+            ['5. + location in (' + SCOPE_SQL + ')',
              "SELECT COUNT(*) AS n FROM transaction t " +
              "JOIN transactionline tl ON tl.transaction = t.id " +
              "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
-             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION],
+             "AND tl.mainline = 'F' AND tl.location IN (" + SCOPE_SQL + ")"],
 
             ['6. + line open and item type',
              "SELECT COUNT(*) AS n FROM transaction t " +
              "JOIN transactionline tl ON tl.transaction = t.id " +
              "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
-             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION + " " +
+             "AND tl.mainline = 'F' AND tl.location IN (" + SCOPE_SQL + ")" + " " +
              "AND tl.isclosed = 'F' AND tl.itemtype IN ('Assembly','InvtPart','Kit') " +
              "AND ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) > 0"],
 
@@ -371,17 +817,17 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
              "JOIN customer c ON c.id = t.entity " +
              "JOIN transactionline tl ON tl.transaction = t.id " +
              "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
-             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION],
+             "AND tl.mainline = 'F' AND tl.location IN (" + SCOPE_SQL + ")"],
 
             ['8. + join item',
              "SELECT COUNT(*) AS n FROM transaction t " +
              "JOIN transactionline tl ON tl.transaction = t.id " +
              "JOIN item i ON i.id = tl.item " +
              "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
-             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION],
+             "AND tl.mainline = 'F' AND tl.location IN (" + SCOPE_SQL + ")"],
 
             ['9. inventorybalance readable',
-             "SELECT COUNT(*) AS n FROM inventorybalance WHERE location = " + HITCH_LOCATION],
+             "SELECT COUNT(*) AS n FROM inventorybalance WHERE location IN (" + SCOPE_SQL + ")"],
 
             ['10. item.custitem_gny_max_buildable readable',
              "SELECT COUNT(*) AS n FROM item WHERE custitem_gny_max_buildable IS NOT NULL"],
@@ -399,7 +845,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
              "JOIN transactionline tl ON tl.transaction = t.id " +
              "JOIN item i ON i.id = tl.item " +
              "WHERE t.type = 'SalesOrd' AND " + statusIn('t.status','SalesOrd',SO_OPEN) + " " +
-             "AND tl.mainline = 'F' AND tl.location = " + HITCH_LOCATION + " " +
+             "AND tl.mainline = 'F' AND tl.location IN (" + SCOPE_SQL + ")" + " " +
              "AND tl.isclosed = 'F' AND tl.itemtype IN ('Assembly','InvtPart','Kit') " +
              "AND ABS(NVL(tl.quantity,0)) - ABS(NVL(tl.quantityshiprecv,0)) > 0"]
         ];
@@ -445,6 +891,214 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         return h;
     }
 
+    /**
+     * Sticky notes plus their replies for the given sales order ids, newest first.
+     * Returns { <soId>: [ { date, msg, priority, isPublic, replies:[] } ] }.
+     */
+    function fetchStickyNotes(soIds) {
+        var byOrder = {};
+        if (!soIds || !soIds.length) return byOrder;
+
+        var CHUNK = 300;
+        var noteIndex = {};
+
+        for (var i = 0; i < soIds.length; i += CHUNK) {
+            var ids = soIds.slice(i, i + CHUNK).join(',');
+            var sql =
+                "SELECT sn.id, sn.custrecord_sn_record_id AS so_id, sn.created, " +
+                "  sn.custrecord_sn_message AS msg, " +
+                "  sn.custrecord_sn_note_category AS priority, " +
+                "  sn.custrecord_sn_is_public AS is_public " +
+                "FROM CUSTOMRECORD_STICK_NOTE sn " +
+                "WHERE sn.custrecord_sn_record_type_script_id = 'salesorder' " +
+                "  AND sn.isinactive = 'F' " +
+                (SHOW_PRIVATE_STICKIES ? "" : "  AND sn.custrecord_sn_is_public = 'T' ") +
+                "  AND sn.custrecord_sn_record_id IN (" + ids + ") " +
+                "ORDER BY sn.created DESC, sn.id DESC";
+
+            query.runSuiteQL({ query: sql }).asMappedResults().forEach(function (r) {
+                var note = {
+                    id: r.id,
+                    date: r.created,
+                    msg: r.msg || '',
+                    priority: STICKY_PRIORITY[r.priority] || '',
+                    isPublic: r.is_public !== 'F',
+                    replies: []
+                };
+                var k = String(r.so_id);
+                if (!byOrder[k]) byOrder[k] = [];
+                byOrder[k].push(note);
+                noteIndex[String(r.id)] = note;
+            });
+        }
+
+        // Replies carry the answers ("shipping 8-18-26", "Brock advised Tue 7/14"),
+        // so they matter more than the question they hang off.
+        var noteIds = Object.keys(noteIndex);
+        for (var j = 0; j < noteIds.length; j += CHUNK) {
+            var nids = noteIds.slice(j, j + CHUNK).join(',');
+            var rsql =
+                "SELECT r.custrecord_snr_note AS note_id, r.created, " +
+                "  r.custrecord_snr_reply AS reply " +
+                "FROM CUSTOMRECORD_STICK_NOTE_REPLY r " +
+                "WHERE r.isinactive = 'F' AND r.custrecord_snr_note IN (" + nids + ") " +
+                "ORDER BY r.created DESC, r.id DESC";
+            query.runSuiteQL({ query: rsql }).asMappedResults().forEach(function (rr) {
+                var n = noteIndex[String(rr.note_id)];
+                if (n) n.replies.push({ date: rr.created, msg: rr.reply || '' });
+            });
+        }
+
+        return byOrder;
+    }
+
+    // ------------------------------------------------------------ writing
+
+    /**
+     * Confirms the target really is a sales order this dashboard covers, so a
+     * crafted POST cannot attach a note to an arbitrary record id.
+     * Returns { id, tranid, custName, custNum } or null.
+     */
+    function verifySalesOrder(soId) {
+        if (!/^\d+$/.test(String(soId))) return null;
+
+        var sql =
+            "SELECT t.id, t.tranid, " +
+            "  NVL(c.companyname, c.altname) AS cust_name, c.entityid AS cust_num " +
+            "FROM transaction t " +
+            "JOIN customer c ON c.id = t.entity " +
+            "WHERE t.id = " + soId + " AND t.type = 'SalesOrd' " +
+            "  AND " + statusIn('t.status', 'SalesOrd', SO_OPEN) + " " +
+            "  AND EXISTS (SELECT 1 FROM transactionline tl WHERE tl.transaction = t.id " +
+            "              AND tl.mainline = 'F' AND tl.location IN (" + SCOPE_SQL + ") " +
+            "              AND tl.isclosed = 'F')";
+
+        var r = query.runSuiteQL({ query: sql }).asMappedResults();
+        if (!r.length) return null;
+        return {
+            id: r[0].id,
+            tranid: r[0].tranid,
+            custName: r[0].cust_name || '',
+            custNum: r[0].cust_num || ''
+        };
+    }
+
+    /**
+     * Creates a StickyNotes note against a sales order.
+     *
+     * NOTE ON BUNDLE BEHAVIOUR: there is no User Event script deployed on
+     * CUSTOMRECORD_STICK_NOTE, so nothing of the bundle's runs when we save this
+     * record. It will store and display on the sales order exactly like any other
+     * note, but any side effects the bundle's own backend Suitelet performs when
+     * you create a note through its UI -- subscriber emails in particular -- will
+     * NOT happen here. Treat a note written from this dashboard as visible, not
+     * as delivered.
+     */
+    function createSticky(so, message, priority, isPublic, userId) {
+        var rec = record.create({
+            type: 'customrecord_stick_note',
+            isDynamic: false
+        });
+
+        // The bundle stores line breaks as the literal token [br].
+        var msg = String(message || '').replace(/\r\n|\r|\n/g, '[br]');
+
+        rec.setValue({ fieldId: 'custrecord_sn_message', value: msg });
+        rec.setValue({ fieldId: 'custrecord_sn_record_id', value: so.id });
+        rec.setValue({
+            fieldId: 'custrecord_sn_record_type_script_id',
+            value: STICKY_NEW.recordTypeScriptId
+        });
+        rec.setValue({
+            fieldId: 'custrecord_sn_scripted_record_type',
+            value: STICKY_NEW.scriptedRecordType
+        });
+        rec.setValue({
+            fieldId: 'custrecord_sn_record_name',
+            value: 'Sales Order: ' + so.custNum + ' ' + so.custName
+        });
+        rec.setValue({ fieldId: 'custrecord_sn_note_category', value: priority });
+        rec.setValue({ fieldId: 'custrecord_sn_is_public', value: isPublic });
+        rec.setValue({ fieldId: 'custrecord_sn_status', value: STICKY_NEW.status });
+        rec.setValue({ fieldId: 'custrecord_sn_z_index', value: STICKY_NEW.zIndex });
+        rec.setValue({ fieldId: 'custrecord_sn_percent_top', value: STICKY_NEW.percentTop });
+        rec.setValue({ fieldId: 'custrecord_sn_percent_left', value: STICKY_NEW.percentLeft });
+
+        // Who may see it when private, and who the bundle treats as subscribed.
+        if (userId) {
+            rec.setValue({ fieldId: 'custrecord_sn_allowed_entities', value: String(userId) });
+        }
+
+        var id = rec.save({ ignoreMandatoryFields: true });
+
+        // Owner drives the author shown on the note. If the deployment runs with
+        // "execute as role = Administrator", the record would otherwise be owned
+        // by Administrator rather than the person who wrote it. Owner is not
+        // always settable, so this is best-effort and never blocks the save.
+        if (userId) {
+            try {
+                record.submitFields({
+                    type: 'customrecord_stick_note',
+                    id: id,
+                    values: { owner: userId },
+                    options: { ignoreMandatoryFields: true }
+                });
+            } catch (ownerErr) {
+                log.audit({
+                    title: 'Sticky owner not settable',
+                    details: 'note ' + id + ': ' + (ownerErr.message || ownerErr)
+                });
+            }
+        }
+
+        return id;
+    }
+
+    /**
+     * POST endpoint for the composer. Returns JSON, not a page.
+     *
+     * This is the one place response.write() is correct: it is an AJAX data
+     * endpoint, not the dashboard. The dashboard itself is still rendered only
+     * through writePage(form) in the GET branch.
+     */
+    function handlePost(context) {
+        var out = { ok: false, error: 'Unrecognised request' };
+
+        try {
+            var body = JSON.parse(context.request.body || '{}');
+            var msg = String(body.message || '').trim();
+
+            if (!msg) {
+                out.error = 'Note text is required.';
+            } else if (msg.length > 4000) {
+                out.error = 'Note is too long (4000 character limit).';
+            } else {
+                var so = verifySalesOrder(body.soId);
+                if (!so) {
+                    out.error = 'That sales order is not an open order at this location.';
+                } else {
+                    var priority = [1, 2, 3].indexOf(Number(body.priority)) >= 0
+                        ? Number(body.priority) : 2;
+                    var isPublic = body.isPublic === false ? 'F' : 'T';
+                    var userId = runtime.getCurrentUser().id;
+
+                    var id = createSticky(so, msg, priority, isPublic, userId);
+                    log.audit({
+                        title: 'Sticky note created',
+                        details: 'note ' + id + ' on ' + so.tranid + ' by user ' + userId
+                    });
+                    out = { ok: true, id: id, tranid: so.tranid };
+                }
+            }
+        } catch (e) {
+            log.error({ title: 'Sticky create failed', details: e });
+            out = { ok: false, error: e.message || String(e) };
+        }
+
+        context.response.setHeader({ name: 'Content-Type', value: 'application/json' });
+        context.response.write(JSON.stringify(out));
+    }
+
     // --------------------------------------------------------- core analysis
 
     /**
@@ -456,7 +1110,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
      * for 100 units each will all show "buildable" against a pool of 42. Here the
      * pool is drawn down as it is consumed.
      */
-    function buildModel(rows, woMap) {
+    function buildModel(rows, woMap, stickyMap) {
         var today = new Date();
         today.setHours(0, 0, 0, 0);
 
@@ -481,7 +1135,13 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 // custbody_promisedate is deliberately NOT used: it is a rigid
                 // trandate+4 on 119 of 122 OEM orders and has corrupt values on 3,
                 // so it carries no real scheduling intent.
-                var tabKey = tabForCategory(r.cat_id);
+                // Shopify is a sales channel, so it wins over whatever category
+                // the customer record happens to carry.
+                // Plant is a separate axis now (the switch above the tabs), so
+                // door orders get the same customer-type tabs as hitch orders.
+                var tabKey = (Number(r.is_shopify) === 1)
+                    ? 'RETAIL'
+                    : tabForCategory(r.cat_id);
                 if (tabKey === 'OEM') {
                     var actual = parseNsDate(r.exp_ship);
                     if (actual) {
@@ -499,11 +1159,16 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                     leadDays: lead,
                     catId: r.cat_id,
                     tab: tabKey,
+                    isShopify: Number(r.is_shopify) === 1,
+                    locId: Number(r.loc_id),
+                    isCustom: false,
+                    total: num(r.order_total),
                     daysLate: due ? daysBetween(due, today) : 0,
                     custNum: r.cust_num,
                     custName: r.cust_name || r.cust_num,
                     parentName: r.parent_name || '',
                     notes: r.order_notes || '',
+                    stickies: [],
                     soStatus: r.so_status,
                     lines: []
                 };
@@ -516,6 +1181,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 itemId: r.item_id,
                 itemName: r.item_name,
                 memo: r.line_memo || '',
+                locId: Number(r.loc_id),
                 qtyOpen: num(r.qty_open),
                 maxBuild: num(r.max_build),
                 qtyAvail: num(r.qty_avail),
@@ -524,8 +1190,13 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 fromBuild: 0,
                 shortfall: 0,
                 status: STATUS.BLOCKED,
-                wo: woMap[r.item_id] || null
+                // Counts only at load time; the rows behind them are fetched
+                // when someone opens the line.
+                wo: woMap[String(r.item_id)] || null,
+                comp: null      // component floor counts arrive via &wipstatus=1 after paint
             };
+
+            if (Number(r.is_custom) === 1) orders[soId].isCustom = true;
 
             orders[soId].lines.push(line);
             lines.push(line);
@@ -548,14 +1219,19 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         var buildPool = {};
 
         lines.forEach(function (ln) {
-            if (!stockPool.hasOwnProperty(ln.itemId)) stockPool[ln.itemId] = ln.qtyAvail;
+            // Stock is physical and sits at ONE plant, so the pool key includes
+            // the location. Build capacity comes from custitem_gny_max_buildable,
+            // which is calculated account-wide, so that pool stays per-item and is
+            // shared across both plants.
+            var sKey = ln.itemId + '@' + ln.locId;
+            if (!stockPool.hasOwnProperty(sKey)) stockPool[sKey] = ln.qtyAvail;
             if (!buildPool.hasOwnProperty(ln.itemId)) buildPool[ln.itemId] = ln.maxBuild;
 
             var need = ln.qtyOpen;
 
             // Stock first -- a finished unit on the shelf beats build capacity.
-            var takeStock = Math.min(need, stockPool[ln.itemId]);
-            stockPool[ln.itemId] -= takeStock;
+            var takeStock = Math.min(need, stockPool[sKey]);
+            stockPool[sKey] -= takeStock;
             ln.fromStock = takeStock;
             need -= takeStock;
 
@@ -571,9 +1247,15 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 ln.status = (ln.fromBuild > 0) ? STATUS.BUILD : STATUS.SHIP;
             } else if (ln.fromStock > 0 || ln.fromBuild > 0) {
                 ln.status = STATUS.PARTIAL;
-            } else if (ln.wo && ln.wo.qty > 0) {
-                ln.status = STATUS.WO;
+            } else if (ln.wo && ln.wo.woCount > 0) {
+                // A traveler-printed work order for this exact item.
+                ln.status = STATUS.WIP;
             } else {
+                // Provisional. The client asks &wipstatus=1 for exactly these
+                // short lines after first paint and upgrades any whose
+                // components are on the floor to WIP in place. Only short lines
+                // are worth asking about (~160 items instead of ~530), and the
+                // lookup no longer blocks the page.
                 ln.status = STATUS.BLOCKED;
             }
         });
@@ -582,6 +1264,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         var list = [];
         Object.keys(orders).forEach(function (k) {
             var o = orders[k];
+            o.stickies = (stickyMap && stickyMap[String(o.id)]) || [];
             var worst = STATUS.SHIP;
             var blocked = 0;
             o.lines.forEach(function (ln) {
@@ -629,7 +1312,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
         var GO     = '#1b7f4b';   // ship now
         var BUILD  = '#1f5f9e';   // build now
         var CAUT   = '#a86a00';   // partial
-        var HOLD   = '#5b3f96';   // on a WO
+        var WIPC   = '#c2650a';   // WIP -- orange, work physically on the floor
         var STOP   = '#b3241f';   // blocked
 
         var NARROW = "'Arial Narrow','Roboto Condensed',Arial,sans-serif";
@@ -647,53 +1330,126 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
 
 
             // ---- tabs -------------------------------------------------------
-            W + ' .tabs{display:flex;gap:0;background:' + STEEL + ';padding:0 18px;align-items:center}' +
+            // Plant switch sits above the tabs: a distinct, higher-order choice.
+            W + ' .plants{display:flex;align-items:center;gap:6px;background:#1d2938;' +
+                'padding:6px 14px}' +
+            W + ' .plant{appearance:none;border:1px solid #3a4c60;background:transparent;' +
+                'color:#9db0c4;font-family:' + NARROW + ';font-size:12px;font-weight:700;' +
+                'letter-spacing:.08em;text-transform:uppercase;padding:4px 14px;border-radius:3px;' +
+                'cursor:pointer;display:flex;align-items:baseline;gap:7px;transition:all .12s}' +
+            W + ' .plant:hover{color:#dbe4ee;border-color:#55697f}' +
+            W + ' .plant.on{background:#fff;color:#1d2938;border-color:#fff}' +
+            W + ' .plant .pc{font-family:' + BODY + ';font-size:11px;font-weight:700;color:#7d8fa3}' +
+            W + ' .plant.on .pc{color:' + DIM + '}' +
+            W + ' .plants .asof{margin-left:auto;font-size:10.5px;color:#7d8fa3;letter-spacing:.02em}' +
+
+            W + ' .tabs{display:flex;gap:2px;background:' + STEEL + ';padding:4px 14px 0 14px;' +
+                'align-items:flex-end}' +
+            W + ' .tab[hidden]{display:none!important}' +
             W + ' .tabs .asof{margin-left:auto;font-size:10.5px;color:#8d9dae;letter-spacing:.02em}' +
-            W + ' .tab{padding:9px 20px 8px 20px;cursor:pointer;font-family:' + NARROW + ';' +
-                'font-size:14px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;' +
-                'color:#93a3b4;border-bottom:3px solid transparent;user-select:none;' +
-                'transition:color .12s,border-color .12s}' +
-            W + ' .tab:hover{color:#dbe4ee}' +
-            W + ' .tab.on{color:#fff;border-bottom-color:#fff}' +
+            // Active tab reads as a lighter panel lifted out of the bar, the way a
+            // real folder tab does. No underline: the old white rule sat directly
+            // above the control row and read as a stray white box.
+            // The active tab becomes the SAME near-white as the control row below
+            // it, so the two read as one connected panel -- a real folder tab.
+            // A slightly-lighter navy was too subtle to register on this bar.
+            // !important because NetSuite's own stylesheet also styles plain
+            // divs inside a form field and can win on background.
+            W + ' .tab{padding:10px 16px;cursor:pointer;font-family:' + NARROW + ';' +
+                'font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;' +
+                'color:#93a3b4;user-select:none;border-radius:5px 5px 0 0;' +
+                'background:transparent;position:relative;' +
+                'transition:background-color .12s,color .12s}' +
+            W + ' .tab:hover{color:#dbe4ee;background:rgba(255,255,255,.12)}' +
+            W + ' .tab.on{color:' + INK + '!important;background:#fff!important;' +
+                'box-shadow:0 -1px 0 ' + EDGE + ' inset}' +
+            W + ' .tab.on:hover{background:#fff!important}' +
             W + ' .tab .tc{margin-left:8px;font-size:11px;color:#7d8d9e;font-weight:600}' +
-            W + ' .tab.on .tc{color:#c6d4e2}' +
+            W + ' .tab.on .tc{color:' + DIM + '}' +
             W + ' .tab.warnTab{color:#e0a3a0}' +
-            W + ' .tab.warnTab.on{color:#fff;border-bottom-color:' + STOP + '}' +
+            W + ' .tab.warnTab.on{color:' + STOP + '!important;background:#fff!important}' +
+            W + ' .tab.warnTab.on .tc{color:#b5766f}' +
 
             // ---- signal row (stat chips double as filters) --------------------
-            W + ' .signals{display:flex;gap:0;background:#fff;border-bottom:1px solid ' + EDGE + '}' +
-            W + ' .sig{flex:1;padding:11px 14px 10px 14px;cursor:pointer;border-right:1px solid ' + EDGE + ';' +
-                'border-top:3px solid transparent;position:relative;transition:background .12s}' +
-            W + ' .sig:last-child{border-right:none}' +
-            W + ' .sig:hover{background:#f5f8fb}' +
-            W + ' .sig.on{background:#f0f5fa;border-top-color:currentColor}' +
-            W + ' .sig .v{font-size:23px;font-weight:600;line-height:1;letter-spacing:-.02em}' +
-            W + ' .sig .k{font-family:' + NARROW + ';font-size:11px;letter-spacing:.09em;' +
-                'text-transform:uppercase;color:' + DIM + ';margin-top:4px;display:flex;' +
-                'align-items:center;gap:5px}' +
-            W + ' .sig .dot{width:7px;height:7px;border-radius:50%;background:currentColor;' +
-                'display:inline-block;flex:none}' +
+            // ---- sticky header ---------------------------------------------
+            // Tabs and the control row travel with the scroll; the column header
+            // sticks directly beneath them. The offset is measured at runtime
+            // (--gyh-head) because the header wraps to two lines on narrow
+            // windows and a hardcoded value would leave a gap or an overlap.
+            W + ' .stickyhead{position:sticky;top:0;z-index:30;' +
+                'box-shadow:0 2px 6px rgba(20,30,45,.10)}' +
 
-            // ---- control bar --------------------------------------------------
-            W + ' .bar{background:#fff;border-bottom:1px solid ' + EDGE + ';padding:9px 18px;' +
-                'display:flex;align-items:center;gap:10px;flex-wrap:wrap}' +
-            W + ' .bar .lab{font-family:' + NARROW + ';font-size:11px;letter-spacing:.09em;' +
+            // ---- control row: signals + search on one line ---------------
+            W + ' .ctl{display:flex;align-items:center;gap:14px;flex-wrap:wrap;' +
+                'background:#fff;border-bottom:1px solid ' + EDGE + ';padding:0 14px;' +
+                'position:relative;z-index:1}' +
+
+            W + ' .signals{display:flex;align-items:center;gap:2px;flex-wrap:wrap}' +
+            W + ' .sig{appearance:none;background:none;border:none;font-family:' + BODY + ';' +
+                'display:flex;align-items:baseline;gap:5px;padding:7px 9px;border-radius:4px;' +
+                'cursor:pointer;white-space:nowrap;color:inherit;transition:background .12s}' +
+            W + ' .sig:hover{background:#f1f5f9}' +
+            W + ' .sig.on{background:#eef4fa;box-shadow:inset 0 -2px 0 currentColor}' +
+            W + ' .total{appearance:none;background:none;border:none;font-family:' + BODY + ';' +
+                'display:flex;align-items:baseline;gap:5px;padding:7px 12px;margin-right:4px;' +
+                'border-radius:4px 4px 0 0;cursor:pointer;white-space:nowrap;color:inherit;' +
+                'transition:background .12s}' +
+            W + ' .total:hover{background:#f1f5f9}' +
+            W + ' .total.on{box-shadow:inset 0 -2px 0 ' + INK + '}' +
+            W + ' .total.on .tk{color:' + INK + '}' +
+            W + ' .totalsep{width:1px;align-self:stretch;margin:6px 4px 6px 0;background:' + EDGE + '}' +
+            W + ' .total .tv{font-size:16px;font-weight:700;color:' + INK + ';line-height:1.2}' +
+            W + ' .total .tk{font-family:' + NARROW + ';font-size:10.5px;letter-spacing:.07em;' +
                 'text-transform:uppercase;color:' + DIM + '}' +
-            W + ' .bar input[type=text]{padding:5px 9px;border:1px solid ' + EDGE + ';border-radius:3px;' +
-                'font-size:12px;font-family:' + BODY + ';width:250px;background:#fbfcfd}' +
-            W + ' .bar input[type=text]:focus{outline:2px solid ' + BUILD + ';outline-offset:-1px;background:#fff}' +
-            W + ' .bar .spacer{margin-left:auto;font-size:11px;color:' + DIM + '}' +
-            W + ' .bar .spacer b{color:' + INK + ';font-weight:600}' +
-            W + ' .chk{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px}' +
-            W + ' .clear{border:none;background:none;color:' + BUILD + ';cursor:pointer;font-size:11px;' +
-                'padding:3px 6px;text-decoration:underline}' +
+            // Belt and braces: the status <select> is script-only plumbing and
+            // must never occupy space, and no control in this row carries its
+            // own border or background.
+            W + ' .ctl select{display:none!important}' +
+            W + ' .ctl [hidden]{display:none!important}' +
+            W + ' .signals,' + W + ' .bar{background:none;border-top:none;' +
+                'border-bottom:none;box-shadow:none}' +
+            W + ' .sig,' + W + ' .clear{background-color:transparent;border:0;box-shadow:none;' +
+                'outline:none}' +
+            W + ' .sig.on{background-color:#eef4fa}' +
+            W + ' .sig:hover,' + W + ' .clear:hover{background-color:#f1f5f9}' +
+            W + ' .sig .v{font-size:14px;font-weight:700;line-height:1.2;color:currentColor}' +
+            W + ' .sig .k{font-family:' + NARROW + ';font-size:10.5px;letter-spacing:.07em;' +
+                'text-transform:uppercase;color:' + DIM + '}' +
+            W + ' .sig.on .k{color:' + INK + '}' +
+            W + ' .sigsep{width:1px;height:20px;background:' + EDGE + ';flex:none}' +
+
+            W + ' .bar{display:flex;align-items:center;gap:9px;margin-left:auto;padding:6px 0}' +
+            W + ' .bar input[type=text]{padding:5px 9px;border:1px solid ' + EDGE + ';border-radius:4px;' +
+                'font-size:12px;font-family:' + BODY + ';width:235px;background:#fbfcfd}' +
+            W + ' .bar input[type=text]:focus{outline:2px solid ' + BUILD + ';outline-offset:-1px;' +
+                'background:#fff}' +
+            W + ' .chk{display:flex;align-items:center;gap:5px;cursor:pointer;font-size:11.5px;' +
+                'color:' + DIM + ';white-space:nowrap}' +
+            W + ' .clear{border:none;background:none;color:' + BUILD + ';cursor:pointer;' +
+                'font-size:11.5px;padding:4px 6px;border-radius:3px}' +
+            W + ' .clear:hover{background:#eef4fa}' +
+            W + ' .spacer{font-size:11px;color:' + DIM + ';white-space:nowrap}' +
+            W + ' .spacer b{color:' + INK + ';font-weight:700}' +
+
+            // ---- sortable headers: indicator only when sorted or hovered -----
+            W + ' th.sortable{cursor:pointer;user-select:none;position:relative;padding-right:18px}' +
+            W + ' th.sortable:hover{color:' + INK + ';background:#f2f6fa}' +
+            W + ' th.sortable:after{content:"";position:absolute;right:7px;top:50%;' +
+                'margin-top:-2px;border-left:3.5px solid transparent;border-right:3.5px solid transparent;' +
+                'opacity:0;transition:opacity .12s}' +
+            W + ' th.sortable:hover:after{opacity:.35;border-bottom:4px solid currentColor}' +
+            W + ' th.sortable.asc:after{opacity:1;border-bottom:4px solid currentColor;border-top:none}' +
+            W + ' th.sortable.desc:after{opacity:1;border-top:4px solid currentColor;border-bottom:none}' +
 
             // ---- board ---------------------------------------------------------
             W + ' table.grid{width:100%;border-collapse:collapse;background:#fff}' +
             W + ' table.grid th{background:#fbfcfd;color:' + DIM + ';text-align:left;' +
                 'padding:8px 10px;font-family:' + NARROW + ';font-size:11px;font-weight:700;' +
                 'text-transform:uppercase;letter-spacing:.09em;border-bottom:1px solid ' + EDGE + ';' +
-                'position:sticky;top:0;z-index:2}' +
+                'position:sticky;top:var(--gyh-head,0px);z-index:20}' +
+            // Empty spacer cells: no background of their own, or they read as a
+            // stray pale box at the left edge of the header.
+            W + ' table.grid th:empty{background:#fbfcfd;padding:0;border-bottom:1px solid ' + EDGE + '}' +
             W + ' table.grid td{padding:9px 10px;border-bottom:1px solid #eef1f4;vertical-align:top}' +
             W + ' tr.ord{cursor:pointer}' +
             W + ' tr.ord:hover td{background:#f6f9fc}' +
@@ -704,23 +1460,71 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             W + ' .c-SHIP{color:' + GO + '}' +
             W + ' .c-BUILD{color:' + BUILD + '}' +
             W + ' .c-PARTIAL{color:' + CAUT + '}' +
-            W + ' .c-WO{color:' + HOLD + '}' +
+            W + ' .c-WIP{color:' + WIPC + '}' +
             W + ' .c-BLOCKED{color:' + STOP + '}' +
 
             // Filled bubbles: colour-as-background reads faster across a dense
             // board than a dot beside text.
-            W + ' .pill{display:inline-block;padding:3px 10px;border-radius:11px;' +
+            W + ' .pill{display:inline-block;padding:3px 10px;border-radius:11px;cursor:help;' +
                 'font-size:10.5px;font-weight:700;letter-spacing:.02em;white-space:nowrap;' +
                 'line-height:1.5}' +
             W + ' .st-ship{background:#dcf0e4;color:#12633a}' +
             W + ' .st-build{background:#dde9f7;color:#164a7d}' +
             W + ' .st-part{background:#fbecd0;color:#835200}' +
-            W + ' .st-wo{background:#e6e0f5;color:#483179}' +
+            W + ' .st-wip{background:#fde6d0;color:#8a4a08}' +
             W + ' .st-block{background:#f9dedd;color:#8e1c18}' +
 
             W + ' .so{font-weight:600;color:' + BUILD + ';font-size:12.5px}' +
             W + ' .cust{font-size:12px}' +
             W + ' .muted{color:' + DIM + ';font-size:10.5px;letter-spacing:.01em}' +
+            W + ' .amt{font-size:10.5px;color:' + DIM + ';font-weight:600;margin-top:1px}' +
+
+            // drill-down: work on the left, conversation on the right
+            W + ' .drill{padding:12px 14px 14px 14px;display:flex;gap:14px;align-items:flex-start}' +
+            W + ' .dmain{flex:1;min-width:0}' +
+            W + ' .dside{width:330px;flex:none}' +
+
+            // WIP build status
+            W + ' .wipcell{padding-top:0!important;background:#fffaf4}' +
+            W + ' .wipwrap{padding:4px 0 2px 0}' +
+            W + ' .wipbar{display:flex;align-items:center;gap:9px;padding:6px 9px;margin:4px 0 2px;' +
+                'background:#fff4e8;border:1px solid #f0d0ad;border-radius:5px;cursor:pointer}' +
+            W + ' .wipbar:hover{background:#ffeeda}' +
+            W + ' .wipico{color:' + WIPC + ';font-size:9px}' +
+            W + ' .wiphead{font-size:11.5px;font-weight:600;color:#8a4a08}' +
+            W + ' .wipbtn{margin-left:auto;border:1px solid #e0b98e;background:#fff;color:#8a4a08;' +
+                'font-family:' + BODY + ';font-size:10.5px;font-weight:700;padding:3px 9px;' +
+                'border-radius:3px;cursor:pointer}' +
+            W + ' .wipbtn:hover{background:#fff8f0}' +
+            W + ' .wippanel{padding:2px 0 4px 6px}' +
+            W + ' .wippanel[hidden]{display:none}' +
+            W + ' .wipmsg{font-size:11px;color:' + DIM + ';padding:7px 2px}' +
+            W + ' .wiperr{color:' + STOP + '}' +
+            W + ' .wipnote{font-size:10.5px;color:' + DIM + ';padding:5px 2px 2px;font-style:italic}' +
+            W + ' .wipshort{display:flex;align-items:baseline;gap:10px;padding:5px 0 2px;' +
+                'border-top:1px solid #f0d0ad;margin-top:3px}' +
+            W + ' .wipshort:first-of-type{border-top:none;margin-top:0}' +
+            W + ' .wsname{font-family:ui-monospace,Consolas,Monaco,monospace;font-weight:700;' +
+                'color:' + INK + ';font-size:11.5px}' +
+            W + ' .wsneed{font-size:11px;color:' + DIM + '}' +
+            W + ' .wsneed b{color:' + INK + '}' +
+            W + ' .wsshort{color:' + STOP + ';font-weight:700}' +
+            W + ' .wipnone{color:' + STOP + ';padding:2px 0 4px 8px}' +
+            W + ' .wipdim{color:' + DIM + '!important;margin-top:6px}' +
+            W + ' .wiphd{display:block;font-family:' + NARROW + ';font-size:10px;' +
+                'letter-spacing:.08em;text-transform:uppercase;color:' + WIPC + ';' +
+                'font-weight:700;margin-bottom:4px}' +
+            W + ' .wiprow{display:flex;align-items:center;gap:9px;padding:2px 0;font-size:11px}' +
+            W + ' .wono{font-weight:600;min-width:74px}' +
+            W + ' .wost{color:' + DIM + ';min-width:62px;font-size:10.5px}' +
+            // Where it is: the work center is the thing people scan for.
+            W + ' .wowc{color:' + INK + ';font-weight:700;font-size:11px;min-width:150px}' +
+            W + ' .wowc .wonum{color:' + DIM + ';font-weight:400;font-size:10.5px;margin-left:3px}' +
+            W + ' .wobar{flex:1;max-width:120px;height:6px;background:#eee1d4;border-radius:3px;' +
+                'overflow:hidden}' +
+            W + ' .wobar > span{display:block;height:100%;background:' + WIPC + '}' +
+            W + ' .woqty{min-width:64px;color:' + INK + '}' +
+            W + ' .wodue{color:' + DIM + ';font-size:10.5px}' +
 
             // days late as a magnitude, not just a red number
             W + ' .late{font-weight:600;font-size:13px}' +
@@ -735,10 +1539,51 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 'letter-spacing:.07em;text-transform:uppercase;cursor:help}' +
 
             // notes: quiet by default, readable when present
-            W + ' .notecell{max-width:340px}' +
-            W + ' .noteflag{display:block;font-size:11px;line-height:1.45;color:#4a5560;' +
-                'border-left:2px solid #e0c86a;padding-left:8px;cursor:help}' +
             W + ' .nonote{color:#c3cad2}' +
+            W + ' .npip{white-space:nowrap}' +
+            W + ' .pip{display:inline-block;font-family:' + NARROW + ';font-size:10px;' +
+                'letter-spacing:.06em;text-transform:uppercase;font-weight:700;padding:2px 7px;' +
+                'border-radius:9px;margin-right:4px;cursor:help}' +
+            W + ' .p-ord{background:#fdf4d8;color:#7a5c0e}' +
+            W + ' .p-sticky{background:#fde9ea;color:#96343a}' +
+            W + ' .p-high{background:#f6d3d4;color:#8e1c18}' +
+
+            // sticky notes -- pink/amber to echo the StickyNotes bundle itself
+            W + ' .sthread{margin:0 0 11px 0}' +
+            W + ' .sthread > b{font-family:' + NARROW + ';text-transform:uppercase;' +
+                'letter-spacing:.07em;color:#93707a;display:block;margin-bottom:5px;font-size:10.5px}' +
+            W + ' .snote{background:#fff6f6;border-left:3px solid #e8a0a4;padding:7px 10px;' +
+                'margin-bottom:6px;border-radius:0 2px 2px 0}' +
+            W + ' .snote.s-high{border-left-color:#c94a44;background:#fff0ef}' +
+            W + ' .smeta{font-size:9.5px;color:#9a8b8b;text-transform:uppercase;' +
+                'letter-spacing:.04em;font-weight:600;margin-bottom:2px}' +
+            W + ' .spriv{color:#b3241f}' +
+            W + ' .sbody{font-size:11.5px;line-height:1.5;color:#43484f}' +
+            W + ' .sreply{margin:6px 0 0 14px;padding:5px 9px;background:#fff;' +
+                'border-left:2px solid #c5cfd9;border-radius:0 2px 2px 0}' +
+
+            // composer
+            W + ' .composer{margin:0 0 12px 0}' +
+            W + ' .cbtn{font-family:' + BODY + ';font-size:11.5px;padding:5px 12px;border-radius:3px;' +
+                'border:1px solid ' + EDGE + ';background:#fff;color:' + BUILD + ';cursor:pointer}' +
+            W + ' .cbtn:hover{background:#f2f7fc;border-color:#b9c7d6}' +
+            W + ' .cbtn.primary{background:' + BUILD + ';color:#fff;border-color:' + BUILD + '}' +
+            W + ' .cbtn.primary:hover{background:#17497c}' +
+            W + ' .cbtn.primary[disabled]{background:#9db4cb;border-color:#9db4cb;cursor:default}' +
+            W + ' .cbtn.ghost{color:' + DIM + '}' +
+            W + ' .cform{background:#fff;border:1px solid ' + EDGE + ';border-radius:4px;padding:10px}' +
+            W + ' .cmsg{width:100%;font-family:' + BODY + ';font-size:12px;line-height:1.45;' +
+                'padding:8px;border:1px solid ' + EDGE + ';border-radius:3px;resize:vertical;' +
+                'box-sizing:border-box}' +
+            W + ' .cmsg:focus{outline:2px solid ' + BUILD + ';outline-offset:-1px}' +
+            W + ' .crow{display:flex;align-items:center;gap:9px;margin-top:8px;flex-wrap:wrap}' +
+            W + ' .clab{font-family:' + NARROW + ';font-size:10.5px;letter-spacing:.08em;' +
+                'text-transform:uppercase;color:' + DIM + '}' +
+            W + ' .cpri{padding:4px 7px;border:1px solid ' + EDGE + ';border-radius:3px;font-size:11.5px}' +
+            W + ' .cspace{margin-left:auto}' +
+            W + ' .cmsgbox{margin-top:8px;font-size:11.5px;padding:6px 9px;border-radius:3px}' +
+            W + ' .cmsgbox.err{background:#fdeceb;color:#8e1c18;border-left:3px solid ' + STOP + '}' +
+            W + ' .cmsgbox.ok{background:#e7f5ec;color:#12633a;border-left:3px solid ' + GO + '}' +
 
             // ---- drill-down -----------------------------------------------------
             W + ' tr.det{display:none}' +
@@ -773,8 +1618,14 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             W + ' .mkey{font-size:10px;color:' + DIM + ';letter-spacing:.01em;white-space:nowrap}' +
             W + ' .mkey b{font-weight:600;color:' + INK + '}' +
 
-            W + ' .wocell{font-size:11px;color:' + HOLD + ';font-weight:600}' +
+            W + ' .wocell{font-size:11px;color:' + WIPC + ';font-weight:600}' +
             W + ' .wonone{color:#c3cad2;font-size:11px}' +
+            W + ' .wocomp{font-size:10.5px;color:' + WIPC + ';font-weight:600;display:inline-block;' +
+                'margin-top:2px}' +
+            W + ' .wofor{font-family:ui-monospace,Consolas,Monaco,monospace;font-size:10.5px;' +
+                'color:' + DIM + ';min-width:96px}' +
+            W + ' .wopr{background:#fde6d0;color:#8a4a08;border-radius:7px;padding:0 5px;' +
+                'font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}' +
 
             // ---- empty state --------------------------------------------------------
             W + ' .empty{padding:44px 18px;text-align:center;color:' + DIM + ';background:#fff}' +
@@ -788,8 +1639,11 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
 
             '@media (max-width:900px){' +
               W + ' .signals{flex-wrap:wrap}' +
-              W + ' .sig{flex:1 0 33%;border-top-width:2px}' +
-              W + ' .notecell{max-width:180px}' +
+              W + ' .ctl{align-items:stretch}' +
+              W + ' .bar{margin-left:0;width:100%}' +
+              W + ' .bar input[type=text]{flex:1;width:auto}' +
+              W + ' .drill{flex-direction:column}' +
+              W + ' .dside{width:100%}' +
             '}' +
             '@media (prefers-reduced-motion:reduce){' +
               W + ' *{transition:none!important;animation:none!important}' +
@@ -803,10 +1657,18 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
      * onclick attributes, which keeps this working if the account ever turns on
      * a stricter content policy.
      */
-    function renderScript() {
+    function renderScript(postUrl) {
         return '<script>' +
             '(function(){' +
             ' var W=' + JSON.stringify(WRAP) + ';' +
+            ' var POST_URL=' + JSON.stringify(postUrl || '') + ';' +
+            ' var ST=' + JSON.stringify((function () {
+                var m = {};
+                Object.keys(STATUS).forEach(function (k) {
+                    m[k] = { label: STATUS[k].label, css: STATUS[k].css, rank: STATUS[k].rank, desc: STATUS[k].desc };
+                });
+                return m;
+            })()) + ';' +
             ' var root=document.getElementById(W);' +
             ' if(!root)return;' +
             ' var GYHBO={};' +
@@ -831,10 +1693,12 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             '  var late=root.querySelector("#"+W+"-late").checked;' +
             '  var rows=root.querySelectorAll("tr.ord");' +
             '  var shown=0;' +
-            '  var st={TOTAL:0,LATE:0,SHIP:0,BUILD:0,PARTIAL:0,WO:0,BLOCKED:0};' +
+            '  var st={TOTAL:0,LATE:0,SHIP:0,BUILD:0,PARTIAL:0,WIP:0,BLOCKED:0};' +
             '  for(var i=0;i<rows.length;i++){' +
             '   var r=rows[i],ok=true;' +
-            '   if(GYHBO.tab&&r.getAttribute("data-tab")!==GYHBO.tab)ok=false;' +
+            '   if(GYHBO.plant&&r.getAttribute("data-loc")!==GYHBO.plant)ok=false;' +
+            '   if(ok&&GYHBO.tab==="CUSTOM"){if(r.getAttribute("data-custom")!=="1")ok=false;}' +
+            '   else if(ok&&GYHBO.tab&&r.getAttribute("data-tab")!==GYHBO.tab)ok=false;' +
             '   if(ok){' +
             '    st.TOTAL++;' +
             '    if(r.getAttribute("data-late")==="1")st.LATE++;' +
@@ -854,12 +1718,15 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             '   var key=cards[j].getAttribute("data-stat");' +
             '   cards[j].textContent=st.hasOwnProperty(key)?st[key]:0;' +
             '  }' +
+            '  var tot=root.querySelector(".total");' +
+            '  if(tot)tot.classList.toggle("on",!s&&!late);' +
             '  var sigs=root.querySelectorAll(".sig");' +
             '  for(var m=0;m<sigs.length;m++){' +
             '   var fv=sigs[m].getAttribute("data-filter");' +
             '   var act=(fv==="__LATE__")?(late&&!s):(fv?(s===fv&&!late):(!s&&!late));' +
             '   sigs[m].classList.toggle("on",!!act);' +
             '  }' +
+            '  GYHBO.resetToggleAll();' +
             '  var er=root.querySelector("#"+W+"-empty");' +
             '  if(er)er.style.display=shown?"none":"";' +
             '  root.querySelector("#"+W+"-cnt").textContent=shown;' +
@@ -874,6 +1741,244 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             '  GYHBO.filter();' +
             ' };' +
 
+            // Sorting keeps each detail row glued to its order row by moving the
+            // pair together, so an expanded row never ends up orphaned.
+            // Expand/collapse all acts on VISIBLE rows only, so it respects the
+            // current tab and search rather than opening 200 hidden rows.
+            ' GYHBO.toggleAll=function(btn){' +
+            '  var expand=btn.getAttribute("data-state")!=="expanded";' +
+            '  var rows=root.querySelectorAll("tr.ord");' +
+            '  var n=0;' +
+            '  for(var i=0;i<rows.length;i++){' +
+            '   var r=rows[i];' +
+            '   if(r.style.display==="none")continue;' +
+            '   var id=r.getAttribute("data-id");' +
+            '   var d=root.querySelector(\'tr.det[data-for="\'+id+\'"]\');' +
+            '   var c=root.querySelector(\'.caret[data-for="\'+id+\'"]\');' +
+            '   if(!d)continue;' +
+            '   d.classList.toggle("open",expand);' +
+            '   if(c)c.innerHTML=expand?"\u25BC":"\u25B6";' +
+            '   n++;' +
+            '  }' +
+            '  btn.setAttribute("data-state",expand?"expanded":"collapsed");' +
+            '  btn.textContent=expand?"Collapse all":"Expand all";' +
+            ' };' +
+
+            // Filtering or switching tabs closes rows, so the button must not
+            // keep claiming everything is expanded.
+            ' GYHBO.resetToggleAll=function(){' +
+            '  var b=root.querySelector("#"+W+"-toggleall");' +
+            '  if(b){b.setAttribute("data-state","collapsed");b.textContent="Expand all";}' +
+            ' };' +
+
+            ' GYHBO.sort=function(key,type){' +
+            '  var tb=root.querySelector("table.grid");' +
+            '  if(!tb)return;' +
+            '  var body=tb.tBodies[0]||tb;' +
+            '  var dir=(GYHBO.sortKey===key&&GYHBO.sortDir===1)?-1:1;' +
+            '  GYHBO.sortKey=key;GYHBO.sortDir=dir;' +
+            '  var rows=[].slice.call(root.querySelectorAll("tr.ord"));' +
+            '  var pairs=rows.map(function(r){' +
+            '   return {r:r,d:root.querySelector(\'tr.det[data-for="\'+r.getAttribute("data-id")+\'"]\')};' +
+            '  });' +
+            '  pairs.sort(function(a,b){' +
+            '   var va=a.r.getAttribute("data-s-"+key),vb=b.r.getAttribute("data-s-"+key);' +
+            '   if(type==="n"){va=parseFloat(va)||0;vb=parseFloat(vb)||0;return (va-vb)*dir;}' +
+            '   return String(va).localeCompare(String(vb))*dir;' +
+            '  });' +
+            '  pairs.forEach(function(p){body.appendChild(p.r);if(p.d)body.appendChild(p.d);});' +
+            '  var ths=root.querySelectorAll("th.sortable");' +
+            '  for(var i=0;i<ths.length;i++){' +
+            '   ths[i].classList.remove("asc","desc");' +
+            '   if(ths[i].getAttribute("data-sort")===key)ths[i].classList.add(dir===1?"asc":"desc");' +
+            '  }' +
+            ' };' +
+
+            // Switching plant re-counts every tab, hides the optional tabs that
+            // are empty for that plant, and keeps the active tab valid so the
+            // board never lands on an empty view.
+            // WIP detail is fetched per item the first time it is opened and
+            // cached, so re-opening is instant. Cache entries older than
+            // WIP_TTL are refetched so a panel left open does not go stale.
+            ' var _wip={},_wipLoading={},_wipErr={};' +
+            ' var WIP_TTL=60000;' +
+
+            ' GYHBO.wipRow=function(w){' +
+            '  var pct=w.qty?Math.min(100,Math.round((w.built/w.qty)*100)):0;' +
+            '  return \'<div class="wiprow">\'' +
+            '   +\'<a href="/app/accounting/transactions/workord.nl?id=\'+w.id+\'" target="_blank" class="wono">\'+GYHBO.esc(w.tranid)+\'</a>\'' +
+            '   +(w.compName?\'<span class="wofor">\'+GYHBO.esc(w.compName)+\'</span>\':\'\')' +
+            '   +(w.wc?\'<span class="wowc">\'+GYHBO.esc(w.wc)+(w.opName&&w.opName!==w.wc?\' \\u00b7 \'+GYHBO.esc(w.opName):\'\')+\' <span class="wonum">\'+w.opDone+\'/\'+w.opQty+\'</span></span>\':\'<span class="wost">\'+GYHBO.esc(w.status)+\'</span>\')' +
+            '   +(w.printed?\'<span class="wopr">traveler</span>\':\'\')' +
+            '   +\'<span class="wobar"><span style="width:\'+pct+\'%"></span></span>\'' +
+            '   +\'<span class="woqty num">\'+w.built+\' / \'+w.qty+\'</span>\'' +
+            '   +\'<span class="wodue num">due \'+GYHBO.esc(w.endDate||"\\u2014")+\'</span>\'' +
+            '   +\'</div>\';' +
+            ' };' +
+
+            ' GYHBO.esc=function(v){return String(v==null?"":v)' +
+            '  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")' +
+            '  .replace(/"/g,"&quot;");};' +
+
+            ' GYHBO.paintWip=function(item){' +
+            '  var panel=root.querySelector(\'.wippanel[data-wipfor="\'+item+\'"]\');' +
+            '  if(!panel)return;' +
+            '  var k=String(item);' +
+            '  if(_wipLoading[k]){panel.innerHTML=\'<div class="wipmsg">Loading work orders\\u2026</div>\';return;}' +
+            '  if(_wipErr[k]){panel.innerHTML=\'<div class="wipmsg wiperr">\'+GYHBO.esc(_wipErr[k])+\'</div>\';return;}' +
+            '  var d=_wip[k]?_wip[k].data:null;' +
+            '  if(!d){panel.innerHTML=\'<div class="wipmsg">Loading work orders\\u2026</div>\';return;}' +
+            '  var h="";' +
+            // The answer first: which part this line is waiting on, and where it is.
+            '  if(d.shorts&&d.shorts.length){' +
+            '   h+=\'<span class="wiphd">Waiting on</span>\';' +
+            '   for(var si=0;si<d.shorts.length;si++){var sc=d.shorts[si];' +
+            '    h+=\'<div class="wipshort"><span class="wsname">\'+GYHBO.esc(sc.name)+\'</span>\'' +
+            '      +\'<span class="wsneed num">need <b>\'+sc.need+\'</b> \\u00b7 have \'+sc.have+\' \\u00b7 <span class="wsshort">short \'+sc.short+\'</span></span></div>\';' +
+            '    if(sc.wos&&sc.wos.length){for(var wi=0;wi<sc.wos.length;wi++){h+=GYHBO.wipRow(sc.wos[wi]);}}' +
+            '    else{h+=\'<div class="wipmsg wipnone">No work order on the floor for this part.</div>\';}' +
+            '   }' +
+            '  }' +
+            '  if(d.direct&&d.direct.length){' +
+            '   h+=\'<span class="wiphd">Building this item</span>\';' +
+            '   for(var i=0;i<d.direct.length;i++){h+=GYHBO.wipRow(d.direct[i]);}' +
+            '  }' +
+            // Running components that are NOT short: context, kept compact.
+            '  var others=[];if(d.components){for(var j=0;j<d.components.length;j++){var cw=d.components[j];' +
+            '   var isShort=false;if(d.shorts){for(var q=0;q<d.shorts.length;q++){if(String(d.shorts[q].id)===String(cw.comp)){isShort=true;break;}}}' +
+            '   if(!isShort)others.push(cw);}}' +
+            '  if(others.length){' +
+            '   h+=\'<span class="wiphd wipdim">Also running \\u00b7 not short</span>\';' +
+            '   for(var k2=0;k2<others.length;k2++){h+=GYHBO.wipRow(others[k2]);}' +
+            '  }' +
+            '  if(d.unprintedDirect>0){' +
+            '   h+=\'<div class="wipnote">\'+d.unprintedDirect+\' more work order\'+(d.unprintedDirect>1?"s":"")' +
+            '     +\' open on this item with no traveler printed \\u2014 not counted as on the floor.</div>\';' +
+            '  }' +
+            '  if(!h){h=\'<div class="wipmsg">Nothing on the floor for this item.</div>\';}' +
+            '  panel.innerHTML=h;' +
+            ' };' +
+
+            ' GYHBO.loadWip=function(item){' +
+            '  var k=String(item);' +
+            '  if(_wipLoading[k])return;' +
+            '  var c=_wip[k];' +
+            '  if(c&&(Date.now()-c.ts)<WIP_TTL){GYHBO.paintWip(item);return;}' +
+            '  _wipLoading[k]=true;delete _wipErr[k];GYHBO.paintWip(item);' +
+            '  var bar=root.querySelector(\'.wipbar[data-wip="\'+item+\'"]\');' +
+            '  var loc=bar?bar.getAttribute("data-loc"):"";var sh=bar?bar.getAttribute("data-short"):"";' +
+            '  fetch(POST_URL+(POST_URL.indexOf("?")>-1?"&":"?")+"wip=1&item="+item+"&loc="+loc+"&short="+sh+"&_="+Date.now(),' +
+            '        {cache:"no-store"})' +
+            '   .then(function(r){return r.json();})' +
+            '   .then(function(d){delete _wipLoading[k];' +
+            '     if(d&&d.ok){_wip[k]={data:d.detail,ts:Date.now()};}' +
+            '     else{_wipErr[k]=(d&&d.error)||"Could not load work orders.";}' +
+            '     GYHBO.paintWip(item);})' +
+            '   .catch(function(e){delete _wipLoading[k];' +
+            '     _wipErr[k]="Could not reach NetSuite \\u2014 tap Detail again.";' +
+            '     GYHBO.paintWip(item);});' +
+            ' };' +
+
+            ' GYHBO.toggleWip=function(bar){' +
+            '  var item=bar.getAttribute("data-wip");' +
+            '  var panel=root.querySelector(\'.wippanel[data-wipfor="\'+item+\'"]\');' +
+            '  var btn=bar.querySelector(".wipbtn");' +
+            '  if(!panel)return;' +
+            '  var open=panel.hasAttribute("hidden");' +
+            '  if(open){panel.removeAttribute("hidden");if(btn)btn.textContent="Hide";GYHBO.loadWip(item);}' +
+            '  else{panel.setAttribute("hidden","");if(btn)btn.textContent="Detail";}' +
+            ' };' +
+
+            // ---- deferred WIP -------------------------------------------------
+            // Runs once after first paint. Asks the server which of the short
+            // lines have components on the floor, then upgrades those lines
+            // and their orders in place -- no reload, no second render.
+            ' GYHBO.applyWip=function(map){' +
+            '  var touched={};' +
+            '  var rows=root.querySelectorAll("tr.lnrow[data-lst=BLOCKED]");' +
+            '  for(var i=0;i<rows.length;i++){var r=rows[i];' +
+            '   var it=r.getAttribute("data-litem");var m=map[it];' +
+            '   if(!m||!m.woCount)continue;' +
+            '   r.setAttribute("data-lst","WIP");r.classList.remove("c-BLOCKED");r.classList.add("c-WIP");' +
+            '   var p=r.querySelector(".lpill");' +
+            '   if(p){p.className="pill lpill "+ST.WIP.css;p.textContent=ST.WIP.label;p.title=ST.WIP.desc;}' +
+            '   var wc=r.querySelector(".wocol");' +
+            '   if(wc){wc.innerHTML=\'<span class="wocomp">\'+m.comps+\' component\'+(m.comps>1?"s":"")+\' on floor</span>\';}' +
+            '   var bits=m.woCount+" WO"+(m.woCount>1?"s":"")+" on "+m.comps+" component"+(m.comps>1?"s":"");' +
+            '   var tr=document.createElement("tr");' +
+            '   tr.innerHTML=\'<td colspan="7" class="wipcell"><div class="wipbar" data-wip="\'+it+\'" data-loc="\'+r.getAttribute("data-lloc")+\'" data-short="\'+r.getAttribute("data-lshort")+\'">\'' +
+            '     +\'<span class="wipico">\\u25cf</span><span class="wiphead">On the floor \\u00b7 \'+GYHBO.esc(bits)+\'</span>\'' +
+            '     +\'<button type="button" class="wipbtn">Detail</button></div>\'' +
+            '     +\'<div class="wippanel" data-wipfor="\'+it+\'" hidden></div></td>\';' +
+            '   var after=r.nextElementSibling;' +
+            '   if(after&&after.querySelector(".linememo"))after=after.nextElementSibling;' +
+            '   r.parentNode.insertBefore(tr,after);' +
+            '   var det=r.closest("tr.det");if(det)touched[det.getAttribute("data-for")]=true;' +
+            '  }' +
+            // recompute each touched order's badge = worst line
+            '  Object.keys(touched).forEach(function(oid){' +
+            '   var det=root.querySelector(\'tr.det[data-for="\'+oid+\'"]\');' +
+            '   var ord=root.querySelector(\'tr.ord[data-id="\'+oid+\'"]\');' +
+            '   if(!det||!ord)return;' +
+            '   var worst="SHIP",wr=-1,short=0;' +
+            '   var ls=det.querySelectorAll("tr.lnrow");' +
+            '   for(var j=0;j<ls.length;j++){var k=ls[j].getAttribute("data-lst");var sd=ST[k];if(!sd)continue;' +
+            '    if(sd.rank>wr){wr=sd.rank;worst=k;}if(sd.rank>=ST.PARTIAL.rank)short++;}' +
+            '   var op=ord.querySelector(".opill");' +
+            '   if(op){op.className="pill opill "+ST[worst].css;op.textContent=ST[worst].label;op.title=ST[worst].desc;}' +
+            '   ord.setAttribute("data-st",worst);ord.setAttribute("data-s-st",String(ST[worst].rank));' +
+            '   ord.className=ord.className.replace(/\\bc-[A-Z]+\\b/g,"").trim()+" c-"+worst;' +
+            '  });' +
+            '  GYHBO.filter();' +
+            ' };' +
+
+            ' GYHBO.deferWip=function(){' +
+            '  var rows=root.querySelectorAll("tr.lnrow[data-lst=BLOCKED]");' +
+            '  var seen={},ids=[];' +
+            '  for(var i=0;i<rows.length;i++){var it=rows[i].getAttribute("data-litem");if(it&&!seen[it]){seen[it]=1;ids.push(it);}}' +
+            '  if(!ids.length)return;' +
+            '  var sig=root.querySelector(".sig.c-WIP .k");' +
+            '  if(sig)sig.setAttribute("data-was",sig.textContent),sig.textContent="WIP \\u2026";' +
+            '  fetch(POST_URL+(POST_URL.indexOf("?")>-1?"&":"?")+"wipstatus=1&items="+ids.join(",")+"&_="+Date.now(),{cache:"no-store"})' +
+            '   .then(function(r){return r.json();})' +
+            '   .then(function(d){if(sig)sig.textContent=sig.getAttribute("data-was")||"WIP";' +
+            '     if(d&&d.ok&&d.wip)GYHBO.applyWip(d.wip);})' +
+            '   .catch(function(){if(sig)sig.textContent=sig.getAttribute("data-was")||"WIP";});' +
+            ' };' +
+
+            ' GYHBO.setPlant=function(loc){' +
+            '  GYHBO.plant=loc;' +
+            '  var ps=root.querySelectorAll(".plant");' +
+            '  for(var i=0;i<ps.length;i++){' +
+            '   ps[i].classList.toggle("on",ps[i].getAttribute("data-plant")===loc);' +
+            '  }' +
+            '  var rows=root.querySelectorAll("tr.ord");' +
+            '  var cnt={},custom=0;' +
+            '  for(var j=0;j<rows.length;j++){' +
+            '   var r=rows[j];' +
+            '   if(r.getAttribute("data-loc")!==loc)continue;' +
+            '   var tk=r.getAttribute("data-tab");' +
+            '   cnt[tk]=(cnt[tk]||0)+1;' +
+            '   if(r.getAttribute("data-custom")==="1")custom++;' +
+            '  }' +
+            '  cnt.CUSTOM=custom;' +
+            '  var tabs=root.querySelectorAll(".tab");' +
+            '  var firstWithRows=null;' +
+            '  for(var k=0;k<tabs.length;k++){' +
+            '   var tb=tabs[k];var key=tb.getAttribute("data-tab");' +
+            '   var n=cnt[key]||0;' +
+            '   var badge=tb.querySelector(".tc");if(badge)badge.textContent=n;' +
+            '   var optional=tb.getAttribute("data-optional")==="1";' +
+            '   tb.hidden=(optional&&n===0);' +
+            '   if(!tb.hidden&&n>0&&key!=="CUSTOM"&&!firstWithRows)firstWithRows=key;' +
+            '  }' +
+            '  var cur=root.querySelector(".tab.on");' +
+            '  var curKey=cur?cur.getAttribute("data-tab"):null;' +
+            '  var curOk=curKey&&(cnt[curKey]||0)>0;' +
+            '  GYHBO.setTab(curOk?curKey:(firstWithRows||curKey));' +
+            '  if(GYHBO.measure)GYHBO.measure();' +
+            ' };' +
+
             ' GYHBO.setTab=function(key){' +
             '  GYHBO.tab=key;' +
             '  var ts=root.querySelectorAll(".tab");' +
@@ -881,19 +1986,33 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             '   ts[i].classList.toggle("on",ts[i].getAttribute("data-tab")===key);' +
             '  }' +
             '  GYHBO.filter();' +
+            '  if(GYHBO.measure)GYHBO.measure();' +
             ' };' +
 
             ' root.addEventListener("click",function(e){' +
             '  var a=e.target.closest?e.target.closest("a"):null;' +
             '  if(a)return;' +
+            '  var th=e.target.closest?e.target.closest("th.sortable"):null;' +
+            '  if(th){GYHBO.sort(th.getAttribute("data-sort"),th.getAttribute("data-type"));return;}' +
+            '  var pl=e.target.closest?e.target.closest(".plant"):null;' +
+            '  if(pl){GYHBO.setPlant(pl.getAttribute("data-plant"));return;}' +
             '  var tb=e.target.closest?e.target.closest(".tab"):null;' +
             '  if(tb){GYHBO.setTab(tb.getAttribute("data-tab"));return;}' +
+            '  var tt=e.target.closest?e.target.closest(".total"):null;' +
+            '  if(tt){GYHBO.applySignal("");return;}' +
             '  var sg=e.target.closest?e.target.closest(".sig"):null;' +
             '  if(sg){GYHBO.applySignal(sg.getAttribute("data-filter"));return;}' +
+            '  var ta=e.target.closest?e.target.closest("#"+W+"-toggleall"):null;' +
+            '  if(ta){GYHBO.toggleAll(ta);return;}' +
             '  var cl=e.target.closest?e.target.closest(".clear"):null;' +
             '  if(cl){var sel=root.querySelector("#"+W+"-st");sel.value="";' +
             '   root.querySelector("#"+W+"-late").checked=false;' +
             '   root.querySelector("#"+W+"-q").value="";GYHBO.filter();return;}' +
+            '  var wb=e.target.closest?e.target.closest(".wipbar"):null;' +
+            '  if(wb){e.stopPropagation();GYHBO.toggleWip(wb);return;}' +
+            '  var cb=e.target.closest?e.target.closest(".composer .cbtn"):null;' +
+            '  if(cb){e.stopPropagation();GYHBO.composer(cb,cb.getAttribute("data-act"));return;}' +
+            '  if(e.target.closest&&e.target.closest(".composer"))return;' +
             '  var tr=e.target.closest?e.target.closest("tr.ord"):null;' +
             '  if(tr)GYHBO.toggle(tr.getAttribute("data-id"));' +
             ' });' +
@@ -904,18 +2023,162 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             ' if(st)st.addEventListener("change",GYHBO.filter);' +
             ' if(q)q.addEventListener("keyup",GYHBO.filter);' +
             ' if(lt)lt.addEventListener("change",GYHBO.filter);' +
+            // --- composer -------------------------------------------------
+            ' GYHBO.composer=function(el,act){' +
+            '  var box=el.closest(".composer");' +
+            '  if(!box)return;' +
+            '  var form=box.querySelector(".cform");' +
+            '  var openBtn=box.querySelector(\'.cbtn[data-act="open"]\');' +
+            '  if(act==="open"){form.hidden=false;openBtn.hidden=true;' +
+            '   box.querySelector(".cmsg").focus();return;}' +
+            '  if(act==="cancel"){form.hidden=true;openBtn.hidden=false;' +
+            '   box.querySelector(".cmsg").value="";' +
+            '   var mb0=box.querySelector(".cmsgbox");mb0.hidden=true;mb0.textContent="";return;}' +
+            '  if(act!=="save")return;' +
+
+            '  var ta=box.querySelector(".cmsg");' +
+            '  var mb=box.querySelector(".cmsgbox");' +
+            '  var btn=box.querySelector(\'.cbtn[data-act="save"]\');' +
+            '  var txt=(ta.value||"").trim();' +
+            '  var show=function(cls,msg){mb.hidden=false;mb.className="cmsgbox "+cls;mb.textContent=msg;};' +
+            '  if(!txt){show("err","Write something first.");ta.focus();return;}' +
+
+            '  btn.disabled=true;btn.textContent="Saving...";' +
+            '  var payload={soId:box.getAttribute("data-so"),message:txt,' +
+            '   priority:Number(box.querySelector(".cpri").value),' +
+            '   isPublic:box.querySelector(".cpub").checked};' +
+
+            '  fetch(POST_URL,{method:"POST",headers:{"Content-Type":"application/json"},' +
+            '   body:JSON.stringify(payload)})' +
+            '   .then(function(r){return r.json();})' +
+            '   .then(function(d){' +
+            '     btn.disabled=false;btn.textContent="Save note";' +
+            '     if(d&&d.ok){show("ok","Saved to "+(d.tranid||"the order")+". Reloading...");' +
+            '      setTimeout(function(){location.reload();},900);}' +
+            '     else{show("err",(d&&d.error)||"Could not save the note.");}' +
+            '   })' +
+            '   .catch(function(err){' +
+            '     btn.disabled=false;btn.textContent="Save note";' +
+            '     show("err","Could not reach the server: "+err);' +
+            '   });' +
+            ' };' +
+
             ' root.addEventListener("keydown",function(e){' +
+            '  if(e.target.closest&&e.target.closest(".composer"))return;' +
             '  if(e.key!=="Enter"&&e.key!==" ")return;' +
-            '  var t=e.target.closest?e.target.closest(".sig,.tab"):null;' +
+            // .sig is a real <button>, so Enter/Space already fire click.
+            // Only the tab divs need explicit keyboard handling.
+            '  var t=e.target.closest?e.target.closest(".tab"):null;' +
             '  if(!t)return;' +
             '  e.preventDefault();' +
-            '  if(t.classList.contains("sig"))GYHBO.applySignal(t.getAttribute("data-filter"));' +
-            '  else GYHBO.setTab(t.getAttribute("data-tab"));' +
+            '  GYHBO.setTab(t.getAttribute("data-tab"));' +
             ' });' +
-            ' var on=root.querySelector(".tab.on");' +
-            ' GYHBO.setTab(on?on.getAttribute("data-tab"):null);' +
+            // Measure the sticky header so the column header parks directly under
+            // it. Re-measured on resize because the control row wraps on narrow
+            // windows and a hardcoded offset would gap or overlap.
+            ' GYHBO.measure=function(){' +
+            '  var hd=root.querySelector(".stickyhead");' +
+            '  if(!hd)return;' +
+            '  var hgt=Math.round(hd.getBoundingClientRect().height);' +
+            '  root.style.setProperty("--gyh-head",hgt+"px");' +
+            ' };' +
+            ' GYHBO.measure();' +
+            ' if(window.ResizeObserver){' +
+            '  try{new ResizeObserver(GYHBO.measure).observe(root.querySelector(".stickyhead"));}' +
+            '  catch(e){}' +
+            ' }' +
+            ' window.addEventListener("resize",GYHBO.measure);' +
+
+            ' var pOn=root.querySelector(".plant.on");' +
+            ' GYHBO.setPlant(pOn?pOn.getAttribute("data-plant"):"1");' +
+            ' setTimeout(GYHBO.deferWip,0);' +
             '})();' +
             '</script>';
+    }
+
+    /**
+     * Compact notes indicator for the main grid.
+     *
+     * The full note text now lives in the expanded view, but hiding it entirely
+     * would mean expanding rows blindly to find out which orders have a "why".
+     * These pips say what exists and hover shows the newest line, so the board
+     * stays scannable without carrying two columns of prose.
+     */
+    function renderNotePips(o) {
+        var bits = [];
+
+        if (o.notes) {
+            bits.push('<span class="pip p-ord" title="' + esc(clip(o.notes, 220)) + '">note</span>');
+        }
+
+        if (o.stickies.length) {
+            var newest = o.stickies[0];
+            var lead = newest.replies.length ? newest.replies[0] : newest;
+            var high = false;
+            o.stickies.forEach(function (n) { if (n.priority === 'High') high = true; });
+
+            bits.push('<span class="pip p-sticky' + (high ? ' p-high' : '') + '" title="' +
+                esc(newest.date + ' - ' + clip(stickyPlain(lead.msg), 200)) + '">' +
+                (o.stickies.length > 1 ? o.stickies.length + ' sticky' : 'sticky') +
+                '</span>');
+        }
+
+        return bits.length ? bits.join('') : '<span class="nonote">&mdash;</span>';
+    }
+
+    /**
+     * Drill-down: the whole thread, newest note first, replies nested under each.
+     */
+    function renderStickyThread(o) {
+        if (!o.stickies.length) return '';
+
+        var h = '<div class="sthread"><b>Sticky notes</b>';
+        o.stickies.forEach(function (n) {
+            h += '<div class="snote' + (n.priority === 'High' ? ' s-high' : '') + '">' +
+                 '<div class="smeta">' + esc(n.date) +
+                 (n.priority ? ' &middot; ' + esc(n.priority) : '') +
+                 (n.isPublic ? '' : ' &middot; <span class="spriv">private</span>') +
+                 '</div>' +
+                 '<div class="sbody">' + stickyHtml(n.msg) + '</div>';
+
+            n.replies.forEach(function (rp) {
+                h += '<div class="sreply">' +
+                     '<div class="smeta">' + esc(rp.date) + ' &middot; reply</div>' +
+                     '<div class="sbody">' + stickyHtml(rp.msg) + '</div>' +
+                     '</div>';
+            });
+            h += '</div>';
+        });
+        return h + '</div>';
+    }
+
+    /**
+     * Inline note composer, one per expanded order. Collapsed to a single button
+     * until used so it does not compete with the data.
+     */
+    function renderComposer(o) {
+        var id = o.id;
+        return '<div class="composer" data-so="' + id + '">' +
+            '<button type="button" class="cbtn" data-act="open">+ Write a sticky note</button>' +
+            '<div class="cform" hidden>' +
+                '<textarea class="cmsg" rows="3" maxlength="4000" ' +
+                    'placeholder="Note for this order&#10;Enter for a new line"></textarea>' +
+                '<div class="crow">' +
+                    '<label class="clab">Priority</label>' +
+                    '<select class="cpri">' +
+                        '<option value="2" selected>Normal</option>' +
+                        '<option value="1">High</option>' +
+                        '<option value="3">Low</option>' +
+                    '</select>' +
+                    '<label class="chk"><input type="checkbox" class="cpub" checked> ' +
+                        '<span>Visible to everyone</span></label>' +
+                    '<span class="cspace"></span>' +
+                    '<button type="button" class="cbtn ghost" data-act="cancel">Cancel</button>' +
+                    '<button type="button" class="cbtn primary" data-act="save">Save note</button>' +
+                '</div>' +
+                '<div class="cmsgbox" hidden></div>' +
+            '</div>' +
+            '</div>';
     }
 
     /**
@@ -955,24 +2218,59 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             if (ln.shortfall) parts.push('<b style="color:#b3241f">' + ln.shortfall + '</b> short');
             var key = '<div class="mkey">' + (parts.join(' &middot; ') || '&mdash;') + '</div>';
 
-            var woTxt = (ln.wo && ln.wo.qty > 0)
-                ? '<span class="wocell">' + ln.wo.qty + ' pcs' +
-                  '<span class="muted"> / ' + ln.wo.count + ' WO' + (ln.wo.count > 1 ? 's' : '') + '</span></span>'
-                : '<span class="wonone">none</span>';
+            var woBits = [];
+            if (ln.wo && ln.wo.woCount > 0) {
+                woBits.push('<span class="wocell">' + ln.wo.woCount + ' WO' +
+                    (ln.wo.woCount > 1 ? 's' : '') + ' &middot; ' + ln.wo.openQty + ' pcs</span>');
+            }
+            if (ln.comp && ln.comp.woCount > 0) {
+                woBits.push('<span class="wocomp">' + ln.comp.comps +
+                    ' component' + (ln.comp.comps > 1 ? 's' : '') + ' on floor</span>');
+            }
+            var woTxt = woBits.length ? woBits.join('<br>') : '<span class="wonone wocell-wait">none</span>';
 
-            h += '<tr class="c-' + ln.status.key + '">' +
+            h += '<tr class="c-' + ln.status.key + ' lnrow" data-lst="' + ln.status.key +
+                    '" data-litem="' + ln.itemId + '" data-lloc="' + ln.locId +
+                    '" data-lshort="' + ln.shortfall + '">' +
                 '<td><a class="item" href="' + itemUrl(ln.itemId) + '" target="_blank">' +
                     esc(ln.itemName) + '</a></td>' +
                 '<td class="num">' + ln.qtyOpen + '</td>' +
                 '<td>' + meter + key + '</td>' +
                 '<td class="num">' + ln.qtyAvail + '</td>' +
                 '<td class="num">' + ln.maxBuild + '</td>' +
-                '<td>' + woTxt + '</td>' +
-                '<td><span class="pill ' + ln.status.css + '">' + ln.status.label + '</span></td>' +
+                '<td class="wocol">' + woTxt + '</td>' +
+                '<td><span class="pill lpill ' + ln.status.css + '" title="' + esc(ln.status.desc) + '">' +
+                    ln.status.label + '</span></td>' +
                 '</tr>';
 
             if (ln.memo) {
                 h += '<tr><td colspan="7" class="linememo">' + esc(ln.memo) + '</td></tr>';
+            }
+
+            // For a line waiting on the floor, show what is actually running.
+            // Collapsed headline only. The work order rows behind it are
+            // fetched from &wip=1 the first time someone opens this line.
+            if (ln.status.key === 'WIP') {
+                var bits = [];
+                if (ln.wo && ln.wo.woCount > 0) {
+                    bits.push(ln.wo.woCount + ' WO' + (ln.wo.woCount > 1 ? 's' : '') +
+                              ' on this item');
+                }
+                if (ln.comp && ln.comp.woCount > 0) {
+                    bits.push(ln.comp.woCount + ' WO' + (ln.comp.woCount > 1 ? 's' : '') +
+                              ' on ' + ln.comp.comps + ' component' +
+                              (ln.comp.comps > 1 ? 's' : ''));
+                }
+                h += '<tr><td colspan="7" class="wipcell">' +
+                     '<div class="wipbar" data-wip="' + ln.itemId +
+                        '" data-loc="' + ln.locId + '" data-short="' + ln.shortfall + '">' +
+                     '<span class="wipico">\u25cf</span>' +
+                     '<span class="wiphead">On the floor &middot; ' +
+                        esc(bits.join(' &middot; ') || 'work in progress') + '</span>' +
+                     '<button type="button" class="wipbtn">Detail</button>' +
+                     '</div>' +
+                     '<div class="wippanel" data-wipfor="' + ln.itemId + '" hidden></div>' +
+                     '</td></tr>';
             }
         });
 
@@ -983,8 +2281,8 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
      * Returns an HTML FRAGMENT (no <html>/<body>) wrapped in #gyh-bo, suitable
      * for an INLINEHTML field.
      */
-    function renderFragment(orders) {
-        var counts = { SHIP: 0, BUILD: 0, PARTIAL: 0, WO: 0, BLOCKED: 0 };
+    function renderFragment(orders, postUrl) {
+        var counts = { SHIP: 0, BUILD: 0, PARTIAL: 0, WIP: 0, BLOCKED: 0 };
         var lateCt = 0;
         orders.forEach(function (o) {
             counts[o.status.key]++;
@@ -996,68 +2294,127 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
 
         // Tab bar. Counts are per-tab so each reads as its own report.
         var tabCounts = {};
-        orders.forEach(function (o) { tabCounts[o.tab] = (tabCounts[o.tab] || 0) + 1; });
+        orders.forEach(function (o) {
+            tabCounts[o.tab] = (tabCounts[o.tab] || 0) + 1;
+            if (o.isCustom) tabCounts.CUSTOM = (tabCounts.CUSTOM || 0) + 1;
+        });
 
+        // Every tab is rendered; setPlant() recounts them and hides the optional
+        // ones that are empty for the selected plant. Server-side filtering would
+        // be wrong here, because a tab empty across both plants combined can still
+        // have orders in one of them.
+        var visibleTabs = TABS;
         var activeTab = null;
-        var visibleTabs = TABS.filter(function (t) {
-            return !t.onlyIfPopulated || (tabCounts[t.key] || 0) > 0;
+        TABS.forEach(function (t) {
+            if (!activeTab && !t.overlay && !t.onlyIfPopulated) activeTab = t.key;
         });
-        visibleTabs.forEach(function (t) {
-            if (!activeTab && (tabCounts[t.key] || 0) > 0) activeTab = t.key;
+
+        h += '<div class="stickyhead">';
+
+        // Plant switch. Counts are filled in by JS so they stay in step with the
+        // rest of the filtering.
+        var plantCounts = { '1': 0, '48': 0 };
+        orders.forEach(function (o) {
+            var k = String(o.locId);
+            if (plantCounts.hasOwnProperty(k)) plantCounts[k]++;
         });
-        if (!activeTab && visibleTabs.length) activeTab = visibleTabs[0].key;
+
+        h += '<div class="plants">';
+        [
+            { id: String(HITCH_LOCATION), label: 'Hitch' },
+            { id: String(DOOR_LOCATION),  label: 'Door' }
+        ].forEach(function (pl, idx) {
+            h += '<button type="button" class="plant' + (idx === 0 ? ' on' : '') +
+                 '" data-plant="' + pl.id + '">' + esc(pl.label) +
+                 '<span class="pc">' + plantCounts[pl.id] + '</span></button>';
+        });
+        h += '<span class="asof">as of ' + fmtDate(new Date()) + '</span>';
+        h += '</div>';
 
         h += '<div class="tabs">';
         visibleTabs.forEach(function (t) {
             h += '<div class="tab' + (t.key === activeTab ? ' on' : '') +
                  (t.key === 'UNASSIGNED' ? ' warnTab' : '') +
-                 '" data-tab="' + t.key + '" tabindex="0">' + esc(t.label) +
-                 '<span class="tc">' + (tabCounts[t.key] || 0) + '</span></div>';
+                 '" data-tab="' + t.key + '" tabindex="0"' +
+                 (t.onlyIfPopulated ? ' data-optional="1"' : '') + '>' + esc(t.label) +
+                 '<span class="tc">' + (tabCounts[t.key] || 0) + '</span></div>';   // JS recounts per plant
         });
-        h += '<span class="asof">GEN-Y HITCH &middot; as of ' + fmtDate(new Date()) + '</span>';
         h += '</div>';
 
         // Signal chips double as the status filter -- clicking one is the same as
         // choosing it from a dropdown, which is the action people actually want
         // after reading the number.
         var SIGS = [
-            { k: 'TOTAL',   label: 'Orders',    cls: '',          filter: ''        },
             { k: 'LATE',    label: 'Past due',  cls: 'c-BLOCKED', filter: '__LATE__' },
             { k: 'SHIP',    label: 'Ship now',  cls: 'c-SHIP',    filter: 'SHIP'    },
             { k: 'BUILD',   label: 'Build now', cls: 'c-BUILD',   filter: 'BUILD'   },
             { k: 'PARTIAL', label: 'Partial',   cls: 'c-PARTIAL', filter: 'PARTIAL' },
-            { k: 'WO',      label: 'On a WO',   cls: 'c-WO',      filter: 'WO'      },
-            { k: 'BLOCKED', label: 'Blocked',   cls: 'c-BLOCKED', filter: 'BLOCKED' }
+            { k: 'WIP',     label: 'WIP',       cls: 'c-WIP',     filter: 'WIP'     },
+            { k: 'BLOCKED', label: 'Not started', cls: 'c-BLOCKED', filter: 'BLOCKED' }
         ];
+
+        // One control row: signals on the left, search on the right. Previously
+        // these were two stacked bands, which made the header taller than the
+        // first few rows of actual data.
+        h += '<div class="ctl">';
+
+        // The total is context, not a filter -- giving it a button's active state
+        // made it read as a stuck toggle. It is a plain label now; Reset clears.
+        // Clicking the total clears the status and past-due filters, showing
+        // every order in the current tab. Its "on" state is a quiet underline
+        // only -- a filled box made it read as a stuck toggle.
+        h += '<button type="button" class="total" title="Show all statuses in this tab">' +
+             '<span class="tv num" data-stat="TOTAL">0</span>' +
+             '<span class="tk">orders</span></button>' +
+             '<span class="totalsep"></span>';
 
         h += '<div class="signals">';
         SIGS.forEach(function (g) {
-            h += '<div class="sig ' + g.cls + '" data-filter="' + g.filter + '" tabindex="0">' +
-                 '<div class="v num" data-stat="' + g.k + '">0</div>' +
-                 '<div class="k">' + (g.cls ? '<span class="dot"></span>' : '') + esc(g.label) + '</div>' +
-                 '</div>';
+            h += '<button type="button" class="sig ' + g.cls + '" data-filter="' + g.filter + '">' +
+                 '<span class="v num" data-stat="' + g.k + '">0</span>' +
+                 '<span class="k">' + esc(g.label) + '</span>' +
+                 '</button>';
         });
         h += '</div>';
 
         h += '<div class="bar">' +
             '<input id="' + WRAP + '-q" type="text" placeholder="Search order, customer, item or note">' +
-            '<label class="chk"><input id="' + WRAP + '-late" type="checkbox"> <span>Past due only</span></label>' +
-            '<button type="button" class="clear" id="' + WRAP + '-clear">Reset filters</button>' +
-            '<select id="' + WRAP + '-st" style="display:none"><option value=""></option>' +
+            '<label class="chk"><input id="' + WRAP + '-late" type="checkbox"> <span>Past due</span></label>' +
+            '<button type="button" class="clear" id="' + WRAP + '-toggleall" ' +
+                'data-state="collapsed">Expand all</button>' +
+            '<button type="button" class="clear" id="' + WRAP + '-clear" title="Clear all filters">Reset</button>' +
+            '<span class="spacer"><b id="' + WRAP + '-cnt" class="num">' + orders.length + '</b> shown</span>' +
+            '<select id="' + WRAP + '-st" hidden><option value=""></option>' +
             '<option value="SHIP"></option><option value="BUILD"></option>' +
-            '<option value="PARTIAL"></option><option value="WO"></option>' +
+            '<option value="PARTIAL"></option><option value="WIP"></option>' +
             '<option value="BLOCKED"></option></select>' +
-            '<span class="spacer">Showing <b id="' + WRAP + '-cnt" class="num">' + orders.length + '</b></span>' +
             '</div>';
+
+        h += '</div>';   // close .ctl
+        h += '</div>';   // close .stickyhead
 
         h += '<table class="grid"><tr>' +
             '<th style="width:4px;padding:0"></th>' +
-            '<th style="width:16px"></th><th>Order</th><th>Customer</th><th>Ordered</th>' +
-            '<th>Due</th><th>Late</th><th>Lines</th><th>Status</th><th>Order notes</th>' +
+            '<th style="width:16px"></th>' +
+            '<th class="sortable" data-sort="num"  data-type="t">Order</th>' +
+            '<th class="sortable" data-sort="cust" data-type="t">Customer</th>' +
+            '<th class="sortable" data-sort="ord"  data-type="n">Ordered</th>' +
+            '<th class="sortable" data-sort="due"  data-type="n">Due</th>' +
+            '<th class="sortable" data-sort="late" data-type="n">Late</th>' +
+            '<th class="sortable" data-sort="lines" data-type="n">Lines</th>' +
+            '<th class="sortable" data-sort="st"   data-type="n">Status</th>' +
+            '<th class="sortable" data-sort="notes" data-type="n" ' +
+                'title="Orders carrying notes">Notes</th>' +
             '</tr>';
 
         orders.forEach(function (o) {
-            var search = (String(o.num) + ' ' + o.custName + ' ' + o.parentName + ' ' + o.custNum + ' ' + o.notes + ' ' +
+            var stickyText = o.stickies.map(function (n) {
+                return stickyPlain(n.msg) + ' ' +
+                       n.replies.map(function (rp) { return stickyPlain(rp.msg); }).join(' ');
+            }).join(' ');
+
+            var search = (String(o.num) + ' ' + o.custName + ' ' + o.parentName + ' ' + o.custNum + ' ' +
+                          o.notes + ' ' + stickyText + ' ' +
                           o.lines.map(function (l) { return l.itemName; }).join(' ')).toLowerCase();
 
             // Severity band for days late: 0 / 1-7 / 8-30 / 30+. Encodes how bad,
@@ -1067,12 +2424,23 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                         : o.daysLate <= 30 ? 'l2' : 'l3';
 
             h += '<tr class="ord c-' + o.status.key + '" data-id="' + o.id + '" data-st="' + o.status.key + '" ' +
-                 'data-tab="' + o.tab + '" ' +
+                 'data-tab="' + o.tab + '" data-custom="' + (o.isCustom ? '1' : '0') + '" ' +
+                 'data-loc="' + o.locId + '" ' +
                  'data-late="' + (o.daysLate > 0 ? '1' : '0') + '" ' +
-                 'data-search="' + esc(search) + '">' +
+                 'data-search="' + esc(search) + '" ' +
+                 'data-s-num="' + esc(o.num) + '" ' +
+                 'data-s-cust="' + esc(String(o.custName).toLowerCase()) + '" ' +
+                 'data-s-ord="' + (o.tranDate ? o.tranDate.getTime() : 0) + '" ' +
+                 'data-s-due="' + (o.dueDate ? o.dueDate.getTime() : 0) + '" ' +
+                 'data-s-late="' + o.daysLate + '" ' +
+                 'data-s-lines="' + o.lines.length + '" ' +
+                 'data-s-st="' + o.status.rank + '" ' +
+                 'data-s-amt="' + Math.round(o.total) + '" ' +
+                 'data-s-notes="' + ((o.notes ? 1 : 0) + o.stickies.length) + '">' +
                 '<td class="edge"><span class="edgebar"></span></td>' +
                 '<td><span class="caret" data-for="' + o.id + '">&#9654;</span></td>' +
-                '<td><a class="so" href="' + soUrl(o.id) + '" target="_blank">' + esc(o.num) + '</a></td>' +
+                '<td><a class="so" href="' + soUrl(o.id) + '" target="_blank">' + esc(o.num) + '</a>' +
+                    '<div class="amt num">' + money(o.total) + '</div></td>' +
                 '<td><div class="cust">' + esc(o.custName) + '</div>' +
                     '<div class="muted">' +
                     (o.parentName ? esc(o.parentName) + ' &middot; ' : '') +
@@ -1087,20 +2455,24 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 '<td class="num">' + o.lines.length +
                     (o.blockedLines ? ' <span class="muted" style="color:#b3241f">' +
                      o.blockedLines + ' short</span>' : '') + '</td>' +
-                '<td><span class="pill ' + o.status.css + '">' + o.status.label + '</span></td>' +
-                '<td class="notecell">' +
-                    (o.notes
-                        ? '<span class="noteflag" title="' + esc(o.notes) + '">' +
-                          esc(clip(o.notes, 90)) + '</span>'
-                        : '<span class="nonote">&mdash;</span>') +
-                '</td>' +
+                '<td><span class="pill opill ' + o.status.css + '" title="' + esc(o.status.desc) + '">' +
+                    o.status.label + '</span></td>' +
+                '<td class="npip">' + renderNotePips(o) + '</td>' +
                 '</tr>';
 
             h += '<tr class="det" data-for="' + o.id + '"><td colspan="10"><div class="drill">';
+
+            h += '<div class="dmain">' + renderLineTable(o) + '</div>';
+
+            // Notes live on the right, under the notes columns they belong to.
+            h += '<div class="dside">';
             if (o.notes) {
                 h += '<div class="notes"><b>Sales team notes</b>' + esc(o.notes) + '</div>';
             }
-            h += renderLineTable(o);
+            h += renderStickyThread(o);
+            h += renderComposer(o);
+            h += '</div>';
+
             h += '</div></td></tr>';
         });
 
@@ -1109,7 +2481,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
              '<div class="big">Nothing matches</div>' +
              'Clear the search or pick a different signal above.</div>';
         h += '</div>';          // close #gyh-bo
-        h += renderScript();    // runs after the wrapper exists in the DOM
+        h += renderScript(postUrl);   // runs after the wrapper exists in the DOM
 
         return h;
     }
@@ -1117,6 +2489,61 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
     // -------------------------------------------------------------- entry pt
 
     function onRequest(context) {
+        // Writes come in as POST from the composer; the dashboard itself is GET.
+        if (context.request.method === 'POST') {
+            handlePost(context);
+            return;
+        }
+
+        // Deferred WIP status for the short lines on the board. Called by the
+        // client right after first paint. Returns { <itemId>: {comps, woCount,
+        // openQty} } for the items that have components on the floor.
+        if (context.request.parameters.wipstatus === '1') {
+            context.response.setHeader({ name: 'Content-Type', value: 'application/json' });
+            try {
+                var raw = String(context.request.parameters.items || '');
+                var ids = raw.split(',').map(function (x) { return Number(x); })
+                             .filter(function (n) { return n > 0; });
+                if (ids.length > 2000) ids = ids.slice(0, 2000);
+                var wipMap = fetchComponentFloorCounts(ids);
+                log.audit({
+                    title: 'wipstatus',
+                    details: ids.length + ' short items asked; ' +
+                             Object.keys(wipMap).length + ' have components on the floor'
+                });
+                context.response.write(JSON.stringify({ ok: true, wip: wipMap }));
+            } catch (wsErr) {
+                log.error({ title: 'wipstatus failed', details: wsErr });
+                context.response.write(JSON.stringify({ ok: false, error: wsErr.message || String(wsErr) }));
+            }
+            return;
+        }
+
+        // On-demand WIP detail for ONE item. This is the expensive half, split
+        // out so the board's own load never pays for panels nobody opened.
+        if (context.request.parameters.wip === '1') {
+            context.response.setHeader({ name: 'Content-Type', value: 'application/json' });
+            try {
+                var wipItem = Number(context.request.parameters.item);
+                if (!wipItem) { throw new Error('A valid item id is required.'); }
+                context.response.write(JSON.stringify({
+                    ok: true,
+                    item: wipItem,
+                    detail: fetchWipDetail(
+                        wipItem,
+                        context.request.parameters.loc,
+                        context.request.parameters.short
+                    )
+                }));
+            } catch (wipErr) {
+                log.error({ title: 'WIP detail failed', details: wipErr });
+                context.response.write(JSON.stringify({
+                    ok: false,
+                    error: wipErr.message || String(wipErr)
+                }));
+            }
+            return;
+        }
         if (context.request.method !== 'GET') return;
 
         var form = serverWidget.createForm({ title: 'Buildable Orders' });
@@ -1147,11 +2574,38 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
             var rows = fetchOpenLines();
             log.audit({ title: 'fetchOpenLines', details: 'rows=' + (rows ? rows.length : 'null') });
 
-            var woMap = fetchPrintedWos();
-            log.audit({ title: 'fetchPrintedWos', details: 'items=' + Object.keys(woMap).length });
+            var woMap = fetchDirectWoCounts();
+            log.audit({ title: 'fetchDirectWoCounts', details: 'items=' + Object.keys(woMap).length });
 
-            var orders = buildModel(rows, woMap);
+
+
+            var soIds = [];
+            var seenSo = {};
+            rows.forEach(function (r) {
+                var k = String(r.so_id);
+                if (!seenSo[k]) { seenSo[k] = 1; soIds.push(r.so_id); }
+            });
+            var stickyMap = fetchStickyNotes(soIds);
+            log.audit({
+                title: 'fetchStickyNotes',
+                details: 'orders with stickies=' + Object.keys(stickyMap).length
+            });
+
+            var orders = buildModel(rows, woMap, stickyMap);
             log.audit({ title: 'buildModel', details: 'orders=' + orders.length });
+
+            // WIP resolution is NOT done here. The page paints with short lines
+            // as "Not started", then the client asks &wipstatus=1 for exactly
+            // those items and upgrades them in place. On a cold BOM cache that
+            // lookup is the slowest thing this Suitelet does, and it no longer
+            // blocks first paint.
+
+            var script = runtime.getCurrentScript();
+            var postUrl = url.resolveScript({
+                scriptId: script.id,
+                deploymentId: script.deploymentId,
+                returnExternalUrl: false
+            });
 
             if (!rows || rows.length === 0) {
                 log.error({
@@ -1161,7 +2615,7 @@ define(['N/query', 'N/ui/serverWidget', 'N/log', 'N/runtime'], function (query, 
                 });
             }
 
-            fld.defaultValue = renderFragment(orders);
+            fld.defaultValue = renderFragment(orders, postUrl);
         } catch (e) {
             log.error({ title: 'GYH_BuildableOrders_SL failed', details: e });
             fld.defaultValue =
